@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from math import dist
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,6 +29,9 @@ from .schema import (
     Predicate,
     TreePatch,
 )
+
+if TYPE_CHECKING:
+    from .procedural import ProcedureSnapshot, RecoveryCondition, RecoveryProcedure
 
 CLOSED_GRIP_M = 0.006
 OPEN_GRIP_M = 0.077
@@ -116,16 +119,21 @@ class Branch:
     focus: str = ""
     revision: int = 0
     request_id: int | None = None
+    recovery_procedure: str | None = None
 
 
 class IntentionTree:
     """组合有序的任务约束和有限深度的结果子树。"""
 
-    def __init__(self, episode_id: str, plan: Plan, library: ProcedureLibrary) -> None:
+    def __init__(
+        self, episode_id: str, plan: Plan, library: ProcedureLibrary, procedures: ProcedureSnapshot | None = None,
+    ) -> None:
         self.id = f"{episode_id}:tree"
         self.episode_id = episode_id
         self.plan = plan
         self.library = library
+        self.procedures = procedures
+        self.consulted: set[tuple[int, str]] = set()
         self.branches = tuple(
             Branch(
                 successor=step + 1 if step + 1 < len(plan.goals) else None,
@@ -135,6 +143,21 @@ class IntentionTree:
             )
             for step, goal in enumerate(plan.goals)
         )
+
+    def prepare_recovery(self, active: ActiveTask, condition: RecoveryCondition) -> RecoveryProcedure | None:
+        """把条件匹配的记忆实例化到当前失败分支，每步对同一条目仅审查一次。"""
+        if self.procedures is None:
+            return None
+        for procedure in self.procedures.recoveries:
+            key = active.step, procedure.id
+            if key in self.consulted or not procedure.matches(active.step, active.goal, condition):
+                continue
+            self.consulted.add(key)
+            branches = list(self.branches)
+            branches[active.step] = replace(branches[active.step], recovery_procedure=procedure.id)
+            self.branches = tuple(branches)
+            return procedure
+        return None
 
     def goal(self, step: int, memory: EpisodicMemory) -> Goal | None:
         """用已核查的放置与抽屉内容绑定延后的角色槽位。"""

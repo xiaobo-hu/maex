@@ -31,6 +31,7 @@ from .memory import (
     gripper_width,
 )
 from .models import Observer, Planner
+from .procedural import ProcedureSnapshot, RecoveryCondition, RecoveryProcedure
 from .schema import (
     ActiveTask,
     Assessment,
@@ -148,7 +149,7 @@ class Executive:
 
     def __init__(
         self, planner: Planner, observer: Observer, executor: Executor, library: ProcedureLibrary,
-        limits: Limits,
+        limits: Limits, *, procedures: ProcedureSnapshot | None = None,
     ) -> None:
         if library.executor != PI05:
             raise ValueError(f"Procedures require an incompatible executor: {library.executor}")
@@ -157,6 +158,7 @@ class Executive:
         self.executor = executor
         self.library = library
         self.limits = limits
+        self.procedures = procedures
         self.episode_id = uuid4().hex
         self.memory = EpisodicMemory()
         self.working = WorkingMemory(executor.latest, limits.timesteps)
@@ -165,7 +167,7 @@ class Executive:
         self.wakeup = asyncio.Event()
         self.window: EvidenceWindow | None = None
         self.expansion: PlanRequest | None = None
-        self.recovery_snapshot: tuple[ActiveTask, int, str, str] | None = None
+        self.recovery_snapshot: tuple[ActiveTask, int, str, str, RecoveryProcedure | None] | None = None
         self.recent_judgments: tuple[Judgment, ...] = ()
         self.started = monotonic()
         self.deadline = self.started + limits.wall_seconds
@@ -238,6 +240,10 @@ class Executive:
 
     async def initialize_tree(self, task: str) -> None:
         """用 Planner 与墙钟预算继续修正无效的初始计划。"""
+        if self.procedures is not None and self.procedures.exemplar is not None:
+            exemplar = self.procedures.exemplar
+            self.log("procedure_retrieved", scope="task", use="plan", revision=self.procedures.revision,
+                     source_episode=exemplar.episode_id, source_seed=exemplar.task.seed)
         feedback = ""
         for attempt in range(self.limits.planner_calls):
             self.planner_count += 1
@@ -254,7 +260,7 @@ class Executive:
                 self.log("global_plan_failed", error=type(error).__name__, reason=str(error))
                 await asyncio.sleep(0.25)
                 continue
-            self.tree = IntentionTree(self.episode_id, plan, self.library)
+            self.tree = IntentionTree(self.episode_id, plan, self.library, self.procedures)
             self.log("global_plan_prepared", plan=plan, usage=usage)
             return
         self.stop("failure", f"Planner budget reached without a valid initial plan. {feedback}".rstrip())
@@ -314,7 +320,7 @@ class Executive:
         if recovery is not None and recovery.done() and self.result is None:
             del self.jobs["recover"]
             assert self.recovery_snapshot is not None
-            active, step, task, feedback = self.recovery_snapshot
+            active, step, task, feedback, procedure = self.recovery_snapshot
             self.recovery_snapshot = None
             try:
                 decision, usage = recovery.result()
@@ -329,7 +335,10 @@ class Executive:
                     self.review_execution(task, active, validation_feedback=validation)
                     return
                 decision, usage = RecoveryDecision(action="retry", refs=(), reason="Recovery request failed"), {}
-            self.apply_recovery(active, step, decision, usage)
+            applied = self.apply_recovery(active, step, decision, usage)
+            if procedure is not None and applied == procedure.action and decision.action == applied:
+                self.log("procedure_committed", id=procedure.id, scope=procedure.scope, goal_step=active.step,
+                         action=applied, epoch=self.executor.active.epoch)
 
     def admit(self, window: EvidenceWindow, assessment: Assessment, usage: dict[str, int]) -> None:
         """只把经过谓词核验的事件写入账本。"""
@@ -586,7 +595,6 @@ class Executive:
             self.resume_at_boundary(active)
             return
         self.last_recovery_at = boundary
-        self.recovery_snapshot = active, current.sequence, task, validation_feedback
         self.planner_count += 1
         lost_pickup = self.lost_pickup(active)
         recovery_subject = active
@@ -596,6 +604,18 @@ class Executive:
             self.record_attempt(active, "goal_unverified")
         attempts = [asdict(report) for report in self.memory.attempts.get(active.step, ())]
         grasp_reference = self.memory.grasp_references.get(lost_pickup) if lost_pickup is not None else None
+        procedure = None
+        if self.procedures is not None and active.step == progress and not validation_feedback:
+            condition = RecoveryCondition.observe(
+                active.goal, active.mode, current.observation,
+                check.outcome if end == current.sequence else Outcome.UNKNOWN, lost_pickup is not None, blocker,
+            )
+            procedure = self.tree.prepare_recovery(active, condition)
+            if procedure is not None:
+                self.log("procedure_retrieved", id=procedure.id, scope=procedure.scope, use="recovery",
+                         revision=self.procedures.revision, goal_step=active.step, epoch=active.epoch,
+                         action=procedure.action, source_episodes=procedure.source_episodes)
+        self.recovery_snapshot = active, current.sequence, task, validation_feedback, procedure
         self.log("recovery_requested", goal_step=active.step, epoch=active.epoch,
                  attempt=active.attempt, robot_state=current.observation.robot_state,
                  lost_pickup=lost_pickup, blocked_by=blocker,
@@ -632,10 +652,13 @@ class Executive:
             previous_observation = grasp_reference.observation
         elif lost_pickup is None and active.mode == "policy" and active.attempt > 1:
             previous_observation = self.working.anchor.observation
+        recovery_options = {"before": previous_observation}
+        if procedure is not None:
+            recovery_options["procedure"] = procedure
         self.start_job("recover", self.planner.recover(
             task, recovery_subject, current.sequence, current.observation,
             self.recent_judgments, focus, lost_pickup, attempts,
-            before=previous_observation,
+            **recovery_options,
         ))
 
     def record_attempt(self, active: ActiveTask, outcome: str) -> None:
@@ -666,7 +689,7 @@ class Executive:
 
     def apply_recovery(
         self, active: ActiveTask, step: int, decision: RecoveryDecision, usage: dict[str, int],
-    ) -> None:
+    ) -> ExecutionMode | None:
         """恢复只触发当前意图的动作，效果仍需 Evidence Gate 核验。"""
         if self.executor.active != active or self.working.latest.sequence != step:
             self.log("recovery_discarded", epoch=active.epoch, reason="stale_snapshot")
@@ -700,12 +723,13 @@ class Executive:
                     self.log("recovery_adjusted", action=mode, reason="gripper_already_closed")
             if fresh:
                 if mode == "return_to_home" and self.move_at_boundary(active, mode):
-                    return
+                    return mode
                 if mode != "return_to_home" and self.transition(active.step, mode=mode):
                     self.dispatch()
-                    return
+                    return mode
             self.log("recovery_rejected", action=decision.action, reason="missing_current_authorization")
         self.resume_at_boundary(active)
+        return None
 
     def resume_at_boundary(self, active: ActiveTask) -> None:
         """继续安全候选，补证抓持，或改变观察条件后再复查。"""

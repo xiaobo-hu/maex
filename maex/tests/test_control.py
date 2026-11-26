@@ -20,6 +20,7 @@ from maex.memory import (
     grasp_settled,
 )
 from maex.models import Observer, Planner, use_checkpoint_pour_labels
+from maex.procedural import ProcedureSnapshot, RecoveryCondition, RecoveryProcedure
 from maex.schema import (
     ActiveTask,
     Assessment,
@@ -825,15 +826,25 @@ async def test_placement_is_admitted_before_clearance_and_delayed_planner_overla
     assert patch["decisions"][0] == "completed_prefix"
 
 
-@pytest.mark.parametrize(("fresh", "width", "expected_command"), [
-    (True, 0.08, 1.0),
-    (False, 0.08, None),
-    (True, 0.001, -1.0),
+@pytest.mark.parametrize(("fresh", "width", "expected_command", "with_memory"), [
+    (True, 0.08, 1.0, False),
+    (False, 0.08, None, False),
+    (True, 0.001, -1.0, False),
+    (True, 0.08, 1.0, True),
+    (False, 0.08, None, True),
 ])
 async def test_uncertain_attempt_keeps_running_and_checks_gripper_recovery(
-    fresh, width, expected_command,
+    fresh, width, expected_command, with_memory,
 ) -> None:
     gripper_commands = []
+    received_procedures = []
+    snapshot = None
+    if with_memory:
+        condition = RecoveryCondition.observe(PICKUP, "policy", frame(0, width).observation,
+                                              Outcome.UNKNOWN, False, None)
+        memory_rule = RecoveryProcedure("example", "global", condition, "close_gripper",
+                                        2, 0, ("source-1", "source-2"), None, None)
+        snapshot = ProcedureSnapshot(2, None, (memory_rule,))
 
     class TestPolicy:
         async def infer(self, instruction, observation):
@@ -854,7 +865,9 @@ async def test_uncertain_attempt_keeps_running_and_checks_gripper_recovery(
             return TreePatch(branches=()), {}
 
         async def recover(self, task, active, step, observation, judgments, hint, lost_pickup, recovery_history,
-                          *, before=None):
+                          *, before=None, procedure=None):
+            if procedure is not None:
+                received_procedures.append(procedure)
             assert recovery_history[-1]["mode"] == "policy"
             assert recovery_history[-1]["outcome"] == "goal_unverified"
             return RecoveryDecision(
@@ -871,7 +884,7 @@ async def test_uncertain_attempt_keeps_running_and_checks_gripper_recovery(
     executor = Executor(TestRobot(), TestPolicy(), frame(0, width), EePoseAdjustmentConfig(), 100)
     executive = Executive(TestPlanner(), TestObserver(), executor, LIBRARY, Limits(
         max_steps=9, wall_seconds=3, attempt_chunks=2,
-    ))
+    ), procedures=snapshot)
     episode = await executive.run("Put cookies into the microwave.")
     assert episode.details["step"] == 9
     assert episode.details["confirmed_prefix"] == 0
@@ -890,6 +903,10 @@ async def test_uncertain_attempt_keeps_running_and_checks_gripper_recovery(
         assert report["outcome"] == "executed" and report["end_step"] - report["start_step"] == 5
         assert report["gripper_after_m"] == (0.001 if expected_command > 0 else 0.08)
     assert committed[-1]["mode"] == "policy"
+    assert received_procedures == ([memory_rule] if with_memory else [])
+    assert sum(event["event"] == "procedure_committed" for event in episode.details["journal"]) == (
+        int(with_memory and fresh)
+    )
 
 
 async def test_dropped_object_reopens_the_grasp_and_preserves_completed_work() -> None:

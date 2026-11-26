@@ -27,10 +27,13 @@ from websockets.asyncio.client import connect
 from roboagent.observer.types import ObservationEvent
 from roboagent.utils.ee_pose import EePoseAdjustmentConfig
 
+from . import MAEX_VERSION
 from .executive import Executive, Limits
 from .executor import PI05, Executor, OpenPiPolicy
 from .memory import ProcedureLibrary
 from .models import Observer, Planner
+from .procedural import ProcedureStore, TaskContext
+from .reflector import publish_trace
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--procedures", type=Path, default=Path(__file__).with_name("procedures.json"))
-    return parser.parse_args()
+    parser.add_argument("--experience-db", type=Path, help="Read a persistent procedural memory")
+    parser.add_argument("--experience-revision", type=int, help="Pin the procedural memory revision for this episode")
+    parser.add_argument("--learn-procedures", action="store_true", help="Publish replayed experience after the episode")
+    args = parser.parse_args()
+    if args.experience_db is None and (args.experience_revision is not None or args.learn_procedures):
+        parser.error("--experience-revision and --learn-procedures require --experience-db")
+    return args
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -77,6 +86,7 @@ async def run(args: argparse.Namespace) -> int:
     if (args.run_dir / "trace.json").exists():
         raise FileExistsError(f"Episode output already exists in {args.run_dir}")
     library = ProcedureLibrary.load(args.procedures)
+    store = ProcedureStore(args.experience_db) if args.experience_db is not None else None
     environment = RemoteRoboMemArenaEnv(config, port=args.env_port)
     video = RoboMemArenaVideoRecorder(args.run_dir / "videos", task_id=args.task, fps=args.video_fps)
     workspace = EePoseAdjustmentConfig(
@@ -88,6 +98,12 @@ async def run(args: argparse.Namespace) -> int:
     try:
         first = ObservationEvent(0, monotonic(), await robot.reset(seed=args.seed))
         instruction = environment.task_description
+        procedures = None
+        if store is not None:
+            procedures = await asyncio.to_thread(
+                store.snapshot, TaskContext(task_id=args.task, instruction=instruction, seed=args.seed),
+                library.executor, library.version, args.experience_revision,
+            )
         model, stream = _create_planner(args.planner, args.model, instruction)
         options = _create_planner_stream_options(
             args.planner, max_retries=args.planner_retries, max_retry_delay_ms=5_000,
@@ -95,7 +111,8 @@ async def run(args: argparse.Namespace) -> int:
         started_at = datetime.now(UTC).isoformat()
         control_hz = 20
         settings = {
-            "agent": "maex", "task": args.task, "seed": args.seed, "task_description": instruction,
+            "agent": "maex", "maex_version": MAEX_VERSION,
+            "task": args.task, "seed": args.seed, "task_description": instruction,
             "planner": args.planner, "model": model.id, "observer_model": args.observer_model,
             "observer_base_url": args.observer_base_url, "executor": PI05,
             "policy_port": args.policy_port, "env_port": args.env_port,
@@ -104,6 +121,12 @@ async def run(args: argparse.Namespace) -> int:
             "procedures": library.model_dump(mode="json"), "limits": asdict(limit),
             "started_at": started_at,
         }
+        if procedures is not None:
+            settings["procedural_memory"] = {
+                "database": str(store.path.resolve()), "revision": procedures.revision, "learn": args.learn_procedures,
+                "plan_source": procedures.exemplar.episode_id if procedures.exemplar is not None else None,
+                "recovery_candidates": len(procedures.recoveries),
+            }
         write_json(args.run_dir / "run_config.json", settings)
         async with (
             connect(
@@ -114,17 +137,25 @@ async def run(args: argparse.Namespace) -> int:
             await asyncio.wait_for(socket.recv(), timeout=60)
             executor = Executor(robot, OpenPiPolicy(socket, args.action_chunk_size, 45),
                                 first, workspace, control_hz)
-            executive = Executive(Planner(model, stream, options, timeout=60),
-                                  Observer(client, args.observer_model), executor, library, limit)
+            exemplar = procedures.exemplar if procedures is not None else None
+            planner = Planner(model, stream, options, timeout=60,
+                              task_example=exemplar.plan if exemplar is not None else None)
+            executive = Executive(planner, Observer(client, args.observer_model), executor, library, limit,
+                                  procedures=procedures)
             print(f"MAEX task {args.task} seed {args.seed} · {instruction}", flush=True)
             result = await executive.run(instruction)
         evaluation = dict(environment.metrics())
         success = int(evaluation["TSR"]) == 1
-        write_json(args.run_dir / "trace.json", {"episode": asdict(result), "evaluation": evaluation})
+        trace_path = args.run_dir / "trace.json"
+        write_json(trace_path, {"episode": asdict(result), "evaluation": evaluation})
         write_official_artifacts(
             args.run_dir, task_id=args.task, seed=args.seed, prompt=instruction,
             evaluation=evaluation, video_dir=args.run_dir / "videos",
         )
+        if store is not None and args.learn_procedures:
+            revision = await asyncio.to_thread(publish_trace, store, trace_path)
+            print(f"Procedural memory · revision {revision}" if revision is not None
+                  else "Procedural memory · no reusable case")
         print(f"{result.status} · {result.summary} · TSR {evaluation['TSR']} · CSR {evaluation['CSR']:.2f}")
         print(args.run_dir / "trace.json")
         return int(result.status == "error")

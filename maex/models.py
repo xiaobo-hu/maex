@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import Callable
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -37,6 +37,9 @@ from .schema import (
     RecoveryDecision,
     TreePatch,
 )
+
+if TYPE_CHECKING:
+    from .procedural import RecoveryProcedure
 
 Output = TypeVar("Output", bound=BaseModel)
 Usage = dict[str, int]
@@ -225,11 +228,14 @@ class Planner:
         stream: Callable[[Model, Context, SimpleStreamOptions], AssistantMessageEventStream],
         options: SimpleStreamOptions,
         timeout: float,
+        *,
+        task_example: Plan | None = None,
     ) -> None:
         self.model = model
         self.stream = stream
         self.options = options
         self.timeout = timeout
+        self.task_example = task_example
 
     async def plan(self, task: str, observation: Observation, feedback: str = "") -> tuple[Plan, Usage]:
         """提交全局约束，初始化有序目标。"""
@@ -237,6 +243,13 @@ class Planner:
         context = f"Task\n{task}"
         if reference:
             context = f"{context}\n\n{reference}"
+        if self.task_example is not None:
+            context = (
+                f"{context}\n\nAn executed plan for this same task in an earlier episode:\n"
+                f"{self.task_example.model_dump_json()}\n"
+                "Use it as an example of goal order. Bind roles and any late-bound slots to this task "
+                "and its current observations. All goals need fresh execution and verification."
+            )
         if feedback:
             context = f"{context}\n\nRevise the previous proposal to fix these validation errors:\n{feedback}"
         plan, usage = await self.ask("create_intention_tree", Plan, PLAN_PROMPT, context, observation)
@@ -268,6 +281,7 @@ class Planner:
         self, task: str, active: ActiveTask, step: int, observation: Observation,
         judgments: tuple[Judgment, ...], hint: str, lost_pickup: int | None,
         recovery_history: list[dict[str, object]], *, before: Observation | None = None,
+        procedure: RecoveryProcedure | None = None,
     ) -> tuple[RecoveryDecision, Usage]:
         """根据最近实测状态选择一次受限的同意图恢复。"""
         context = {
@@ -282,6 +296,14 @@ class Planner:
                 ) if frame is not None
             ],
         }
+        if procedure is not None:
+            context["retrieved_recovery"] = {
+                "scope": procedure.scope, "observed_condition": procedure.condition.model_dump(mode="json"),
+                "candidate_action": procedure.action, "verified_episodes": procedure.support,
+                "contradictory_episodes": procedure.contradictions,
+                "instruction": "Re-evaluate this candidate using the current views and physical prerequisites. "
+                               "Cite current image IDs. Choose a different action when better supported.",
+            }
         if lost_pickup is not None:
             prompt = PICKUP_REPAIR_PROMPT
             if before is not None:
