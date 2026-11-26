@@ -147,10 +147,6 @@ If only a neighboring panel, handle or robot motion is visible, keep the result
 unknown unless the named panel is visibly in the opposite state."""
 
 RECOVERY_PROMPT = """You are choosing a recovery for the current RoboArena manipulation intent.
-Choose from the current boundary's available actions in procedure_hint. The list checks
-physical prerequisites and camera availability. Check the visible conditions below before
-selecting an action and cite the required current images. Retry lets the executive reassess
-the current boundary under its existing rules.
 Use the two latest camera views and measured robot state to diagnose why the active
 instruction is stalled. Earlier Observer descriptions may be wrong. Compare them to
 the actual images and gripper feedback. If earlier images are present, use them to
@@ -287,9 +283,16 @@ class Planner:
             ],
         }
         if lost_pickup is not None:
+            prompt = PICKUP_REPAIR_PROMPT
+            if before is not None:
+                context["verified_pickup_images_first"] = len(before.llm_content())
+                prompt += (
+                    "\nThe earlier images show the verified pickup. Match the same object's appearance "
+                    "before using its current location as evidence for regrasp. Cite only the latest images."
+                )
             repair, usage = await self.ask(
-                "review_lost_pickup", PickupRepair, PICKUP_REPAIR_PROMPT,
-                json.dumps(context), observation,
+                "review_lost_pickup", PickupRepair, prompt,
+                json.dumps(context), observation, before=before,
             )
             action = "retry"
             if repair.needs_regrasp:
@@ -378,7 +381,7 @@ class Observer:
                 "Use it to recognize the same item and receptacle in the current frames."
                 if window.recheck_step is not None else
                 "Verified appearance reference showing the target during an earlier pickup. "
-                "Use it to recognize the object in the current frames."
+                "Use it to distinguish the same object from similar items. Cite current frames for the result."
             )
             content.append({"type": "text", "text": reference_text})
             for frame in (reference.observation.rgb, reference.observation.wrist_rgb):

@@ -315,15 +315,18 @@ async def test_checkpoint_cleanup_is_optional_for_microwave_placement() -> None:
     ("restage_vla", ("front_20", "wrist_20"), "retry"),
 ])
 async def test_occluded_placement_can_retract_once_with_two_current_views(mode, refs, action) -> None:
+    verified_pickup = frame(10, 0.04).observation
+
     class TestPlanner(Planner):
-        async def ask(self, name, output, prompt, context, observation):
+        async def ask(self, name, output, prompt, context, observation, *, before=None):
+            assert before is verified_pickup
             return PickupRepair(needs_regrasp=False, clear_retraction=True, refs=refs,
                                 reason="The object's support and retraction path are visible."), {}
 
     planner = TestPlanner(None, None, None, 1)
     active = ActiveTask(1, PLACEMENT, 1, 3, 15, 0, PI05, mode)
     decision, _ = await planner.recover("Put cookies in the microwave.", active, 20, frame(20).observation,
-                                        (), "", 0, [])
+                                        (), "", 0, [], before=verified_pickup)
     assert decision.action == action
 
 
@@ -993,27 +996,6 @@ async def test_grasp_lost_before_handoff_resumes_pickup() -> None:
     assert executive.memory.progress == 0
     assert executive.memory.corrections[-1]["supersedes_request_id"] == pickup.request_id
     assert chunk.task.step == 0 and chunk.task.epoch == 2
-
-
-@pytest.mark.parametrize(("goal", "expected"), (
-    (Goal(predicate="opened", target="microwave", instruction="open the microwave door"),
-     ("retry", "restage_vla", "return_to_home")),
-    (PICKUP, ("retry", "open_gripper", "restage_vla", "return_to_home")),
-))
-async def test_recovery_prompt_lists_actions_available_at_the_current_boundary(goal, expected) -> None:
-    class TestPlanner:
-        async def recover(self, task, active, step, observation, judgments, hint, lost_pickup, history, *, before):
-            assert hint.startswith(f"Available actions at the current boundary: {', '.join(expected)}.")
-            return RecoveryDecision(action="retry", refs=(), reason="Retry according to the current views."), {}
-
-    initial = frame(0, width=0.004)
-    initial.observation.robot_state["gripper_command"] = 1.0
-    executor = Executor(None, None, initial, EePoseAdjustmentConfig(), 20)
-    executive = Executive(TestPlanner(), None, executor, LIBRARY, Limits())
-    executive.tree = IntentionTree(executive.episode_id, Plan(goals=(goal,)), LIBRARY)
-    assert executive.transition(0)
-    executive.review_execution(goal.instruction, executor.active)
-    await executive.jobs["recover"]
 
 
 async def test_recovery_validation_retries_once_at_the_same_action_boundary() -> None:

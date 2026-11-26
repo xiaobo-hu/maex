@@ -260,8 +260,10 @@ class WorkingMemory:
 
     def sample(
         self, active: ActiveTask, *, inspect: bool = False, include_pour: bool = False,
+        appearance_reference: bool = False,
     ) -> tuple[ObservationEvent, ...]:
-        """选择起点、末帧及与持物状态或倾倒相关的关键帧。"""
+        """选择起点、末帧及与持物、松爪或倾倒有关的关键帧。"""
+        timesteps = max(2, self.timesteps - 1) if appearance_reference else self.timesteps
         pouring = include_pour or active.goal.predicate == Predicate.POURED
         horizon = 115 if inspect or pouring else 60
         recent = tuple(frame for frame in self.frames if frame.sequence >= max(
@@ -283,17 +285,27 @@ class WorkingMemory:
             )
             if before_grasp is not None or len(settled) > 1 or not pouring:
                 recent = settled
-        if len(recent) + int(before_grasp is not None) <= self.timesteps:
+        if len(recent) + int(before_grasp is not None) <= timesteps:
             return recent if before_grasp is None else (before_grasp, *recent)
         picks = {recent[-1].sequence: recent[-1]}
         if before_grasp is not None:
             picks[before_grasp.sequence] = before_grasp
-        if len(picks) < self.timesteps:
+        if active.goal.predicate == Predicate.PLACED and (gripper_width(recent[-1].observation) or 0) >= OPEN_GRIP_M:
+            for before, after in zip(reversed(recent[:-1]), reversed(recent[1:]), strict=True):
+                width = gripper_width(before.observation)
+                if width is None or before.sequence + 1 != after.sequence:
+                    break
+                if width < OPEN_GRIP_M:
+                    for event in (before, after):
+                        if len(picks) < timesteps:
+                            picks[event.sequence] = event
+                    break
+        if len(picks) < timesteps:
             picks[recent[0].sequence] = recent[0]
-        if (self.timesteps >= 3 and active.goal.predicate in {Predicate.OPENED, Predicate.CLOSED}
+        if (timesteps >= 3 and active.goal.predicate in {Predicate.OPENED, Predicate.CLOSED}
                 and self.anchor.sequence < recent[0].sequence):
             picks[self.anchor.sequence] = self.anchor
-        if pouring and len(recent) > 2 and len(picks) < self.timesteps:
+        if pouring and len(recent) > 2 and len(picks) < timesteps:
             start = recent[0].observation.robot_state["eef_axis_angle"]
             orientation_peak = max(recent[1:-1], key=lambda frame: sum(
                 (current - initial) ** 2 for current, initial in zip(
@@ -301,15 +313,15 @@ class WorkingMemory:
                 )
             ))
             picks[orientation_peak.sequence] = orientation_peak
-        if before_grasp is not None and len(picks) < self.timesteps:
+        if before_grasp is not None and len(picks) < timesteps:
             lift_peak = max(recent, key=lambda frame: frame.observation.robot_state["eef_position"][2])
             picks[lift_peak.sequence] = lift_peak
         keyframes = detect_gripper_keyframes(None, recent, threshold=GRIPPER_KEYFRAME_DELTA_M)
-        if keyframes and len(picks) < self.timesteps:
+        if keyframes and len(picks) < timesteps:
             sequence = keyframes[-1].sequence
             picks[sequence] = next(frame for frame in recent if frame.sequence == sequence)
         for fraction in ((0.70, 0.34, 0.5) if inspect else (0.5, 0.75, 0.25)):
-            if len(picks) >= self.timesteps:
+            if len(picks) >= timesteps:
                 break
             frame = recent[round((len(recent) - 1) * fraction)]
             picks[frame.sequence] = frame

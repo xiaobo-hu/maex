@@ -1,5 +1,5 @@
 {
-  "version": "robomemarena-pi05-v23-pickup-fixture-evidence",
+  "version": "robomemarena-pi05-v23-pickup-fixture-evidence-placement-reference",
   "executor": "pi05_robomemarena",
   "templates": {
     "held":   {"evidence": ["identity", "effect"], "recoveries": ["retry", "retreat"]},

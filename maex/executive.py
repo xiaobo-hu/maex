@@ -595,10 +595,11 @@ class Executive:
         if active.mode == "policy" and not validation_feedback:
             self.record_attempt(active, "goal_unverified")
         attempts = [asdict(report) for report in self.memory.attempts.get(active.step, ())]
-        options = self.recovery_options(active, current) if lost_pickup is None else None
+        grasp_reference = self.memory.grasp_references.get(lost_pickup) if lost_pickup is not None else None
         self.log("recovery_requested", goal_step=active.step, epoch=active.epoch,
                  attempt=active.attempt, robot_state=current.observation.robot_state,
-                 lost_pickup=lost_pickup, blocked_by=blocker, available_actions=options)
+                 lost_pickup=lost_pickup, blocked_by=blocker,
+                 pickup_reference=grasp_reference.sequence if grasp_reference is not None else None)
         focus = branch.focus
         if active.step < self.memory.progress:
             focus = (
@@ -626,44 +627,16 @@ class Executive:
                 f"Retry the same observation using exactly the supplied tool schema. "
                 f"Correct the invalid fields: {validation_feedback}. {focus}"
             )
-        if options is not None:
-            focus = f"Available actions at the current boundary: {', '.join(options)}. {focus}"
+        previous_observation = None
+        if grasp_reference is not None:
+            previous_observation = grasp_reference.observation
+        elif lost_pickup is None and active.mode == "policy" and active.attempt > 1:
+            previous_observation = self.working.anchor.observation
         self.start_job("recover", self.planner.recover(
             task, recovery_subject, current.sequence, current.observation,
             self.recent_judgments, focus, lost_pickup, attempts,
-            before=self.working.anchor.observation if active.mode == "policy" and active.attempt > 1 else None,
+            before=previous_observation,
         ))
-
-    @staticmethod
-    def required_recovery_refs(active: ActiveTask, mode: str, step: int) -> set[str]:
-        """给出当前恢复动作必须引用的相机帧。"""
-        if mode in {"release_gripper", "pull_drawer", "restage_vla"} or (
-            mode == "close_gripper" and active.goal.is_drawer_motion
-        ):
-            return {f"front_{step}", f"wrist_{step}"}
-        return {f"wrist_{step}"} if mode == "close_gripper" else set()
-
-    def recovery_options(self, active: ActiveTask, current: ObservationEvent) -> tuple[str, ...]:
-        """预检查当前状态与相机覆盖，给 Planner 提供可申请的恢复操作。"""
-        assert self.tree is not None
-        available = {f"{view}_{current.sequence}" for view, image in (
-            ("front", current.observation.rgb), ("wrist", current.observation.wrist_rgb),
-        ) if image is not None}
-        options = ["retry"]
-        if not available:
-            return tuple(options)
-        modes: tuple[ExecutionMode, ...] = (
-            "open_gripper", "close_gripper", "release_gripper", "pull_drawer", "restage_vla", "return_to_home",
-        )
-        for mode in modes:
-            if not self.required_recovery_refs(active, mode, current.sequence) <= available:
-                continue
-            if mode == "return_to_home" and (active.step, active.attempt, mode) in self.boundary_recoveries:
-                continue
-            candidate = self.candidate_for(active.step, mode)
-            if candidate is not None and IntentGate.blocked(candidate, self.executor, self.memory, self.tree, self.working) is None:
-                options.append(mode)
-        return tuple(options)
 
     def record_attempt(self, active: ActiveTask, outcome: str) -> None:
         """用实际起止反馈记录一次恢复或未核验的策略尝试。"""
@@ -714,8 +687,12 @@ class Executive:
             self.log("recovery_rejected", action=decision.action, reason="lost_pickup_not_established")
         elif decision.action != "retry":
             mode = decision.action
-            fresh = fresh and self.required_recovery_refs(active, mode, step) <= set(decision.refs)
+            if mode in {"release_gripper", "pull_drawer", "restage_vla"}:
+                fresh = fresh and len(available) == 2 and set(decision.refs) == available
             if mode == "close_gripper":
+                fresh = fresh and f"wrist_{step}" in decision.refs
+                if active.goal.is_drawer_motion:
+                    fresh = fresh and len(available) == 2 and set(decision.refs) == available
                 width = gripper_width(observation)
                 if (active.goal.predicate == Predicate.HELD and fresh
                         and width is not None and width <= CLOSED_GRIP_M):
@@ -922,6 +899,10 @@ class Executive:
                 clearance = goal.destination
         sample_task = active
         identity_reference = None
+        if active.goal.predicate == Predicate.PLACED and not grasp_preserved((self.working.latest,), end):
+            grasp = self.memory.pickup_for(active.step, active.goal.target)
+            if grasp is not None:
+                identity_reference = self.memory.grasp_references.get(grasp.step)
         if pickup is not None:
             goals = [(pickup.step, pickup.goal)]
             clearance = None
@@ -946,6 +927,7 @@ class Executive:
                 focus = f"{focus} Verify the reported contradiction using the exact target's appearance and location.".strip()
         frames = self.working.sample(
             sample_task, inspect=inspect, include_pour=Predicate.POURED in predicates,
+            appearance_reference=sample_task.goal.predicate == Predicate.PLACED and identity_reference is not None,
         )
         fixture_reference = None
         if active.goal.predicate in {Predicate.OPENED, Predicate.CLOSED}:
