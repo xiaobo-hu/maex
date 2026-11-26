@@ -1,0 +1,98 @@
+{
+  "num_tasks": 26,
+  "seed": 100,
+  "maex_procedure_version": "robomemarena-pi05-v24",
+  "provenance": {
+    "maex_batch_directory": "benchmark/robomemarena/logs/maex/full-v24-seed100-20261125T184957Z",
+    "maex_source_hashes": "benchmark/robomemarena/logs/maex/full-v24-seed100-20261125T184957Z/source_sha256.txt",
+    "roboagent_reference": "benchmark/robomemarena/logs/maex/full-v24-seed100-20261125T184957Z/roboagent_reference.csv",
+    "maex_observer_service": "preexisting",
+    "maex_parallel_workers": 8,
+    "duration_definition": "Per-task wall time recorded in separate parallel batches. Model service startup is excluded."
+  },
+  "maex": {
+    "TSR": 23.076923076923077,
+    "CSR": 55.833333333333336,
+    "mean_steps": 2104.923076923077,
+    "mean_duration_seconds": 533.8076923076923,
+    "successful_tasks": [
+      2,
+      3,
+      8,
+      15,
+      24,
+      25
+    ]
+  },
+  "roboagent": {
+    "TSR": 26.923076923076923,
+    "CSR": 56.76282051282051,
+    "mean_steps": 2038.1153846153845,
+    "mean_duration_seconds": 310.2307692307692,
+    "successful_tasks": [
+      2,
+      3,
+      7,
+      15,
+      21,
+      23,
+      25
+    ]
+  },
+  "delta": {
+    "TSR": -3.8461538461538467,
+    "CSR": -0.9294871794871753,
+    "mean_steps": 66.8076923076926,
+    "mean_duration_seconds": 223.57692307692304
+  },
+  "relative_delta_pct": {
+    "mean_steps": 3.2779151176615042,
+    "mean_duration_seconds": 72.06793949913215
+  },
+  "exclusive_successes": {
+    "maex": [
+      8,
+      24
+    ],
+    "roboagent": [
+      7,
+      21,
+      23
+    ]
+  },
+  "csr_task_counts": {
+    "maex_higher": 7,
+    "tied": 10,
+    "roboagent_higher": 9
+  },
+  "both_successful": {
+    "tasks": [
+      2,
+      3,
+      15,
+      25
+    ],
+    "maex": {
+      "TSR": 100,
+      "CSR": 100.0,
+      "mean_steps": 1333,
+      "mean_duration_seconds": 302.75
+    },
+    "roboagent": {
+      "TSR": 100,
+      "CSR": 100.0,
+      "mean_steps": 1003.25,
+      "mean_duration_seconds": 159
+    }
+  },
+  "maex_terminal_status_counts": {
+    "failure": 17,
+    "success": 6,
+    "safety_stop": 3
+  },
+  "maex_retried_tasks": [],
+  "maex_shutdown_error_tasks": [],
+  "maex_full_csr_without_tsr_tasks": [
+    7
+  ]
+}

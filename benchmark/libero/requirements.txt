@@ -1,0 +1,10 @@
+# LIBERO 的完整依赖以 benchmark/.external/LIBERO/requirements.txt 为准。
+# 这里仅记录 RoboAgent 适配层和官方环境共同使用的关键版本，避免升级官方锁定依赖。
+numpy==1.22.4
+robosuite==1.4.0
+bddl==1.0.1
+PyYAML>=6,<7
+imageio==2.35.1
+msgpack==1.1.1
+Pillow==10.4.0
+websockets==13.1

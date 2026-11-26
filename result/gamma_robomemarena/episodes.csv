@@ -1,0 +1,5 @@
+task,seed,success,stage_success_pct,simulation_steps,policy_steps,wall_time_s,policy_calls,failure_reason,stages
+1,50,1,100.0,1077,1067,783.757326,107,,"{""01_Place_Cookies_Basket"": true, ""02_Place_Tomato_Basket"": true}"
+2,50,1,100.0,874,864,639.36291,87,,"{""01_Place_Butter_Basket"": true, ""02_Place_Popcorn_Basket"": true}"
+3,50,1,100.0,885,875,595.226551,88,,"{""01_Place_Cream_Basket"": true, ""02_Place_Pudding_Basket"": true}"
+5,50,0,0.0,2510,2500,829.320081,250,incomplete_stage,"{""01_Open_Top_Drawer"": false, ""02_Close_Top_Drawer"": false, ""03_Open_Middle_Drawer"": false, ""04_Close_Middle_Drawer"": false, ""05_Open_Bottom_Drawer"": false, ""06_Close_Bottom_Drawer"": false, ""07_Open_Middle_Drawer_Again"": false, ""08_Put_Butter_Middle_Drawer"": false, ""09_Close_Middle_Drawer_Final"": false}"

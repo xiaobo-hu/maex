@@ -1,0 +1,38 @@
+diff --git a/vlm_orchestrator/strategies/subgoal_base.py b/vlm_orchestrator/strategies/subgoal_base.py
+index a8cc8b4..56e2906 100644
+--- a/vlm_orchestrator/strategies/subgoal_base.py
++++ b/vlm_orchestrator/strategies/subgoal_base.py
+@@ -620,11 +620,23 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
+         for calls that need more room (e.g. recycle with many subgoals).
+         """
+         from vlm_orchestrator.vlm import chat_create
++        reference = getattr(self, "_task_primitive_reference", None)
++        if reference:
++            # 同一任务的静态参考供分解、监控和重规划使用；不作为场景状态证据。
++            user_content = [*user_content, {"type": "text", "text": reference}]
++            system_prompt += (
++                "\n\nIf a RoboMemArena primitive reference is provided, use its ordered labels "
++                "as a strong reference for step boundaries, order, and VLA instruction wording. "
++                "It describes checkpoint-era language, not current scene state or completion. "
++                "Preserve the actual task's objects, destinations, counts, and conditions "
++                "when they conflict with a legacy label or note."
++            )
+         response = chat_create(
+             self.client,
+             model=self.config.vlm_model,
+             temperature=self.config.vlm_temperature,
+             max_tokens=max_tokens or self.config.vlm_max_tokens,
++            audit_dir=getattr(self, "_vlm_audit_dir", None),
+             messages=[
+                 {"role": "system", "content": system_prompt},
+                 {"role": "user", "content": user_content},
+@@ -786,6 +798,9 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
+     def _on_new_episode(
+         self, obs: dict, state: SessionState, prompt: str,
+     ) -> tuple[dict, SessionState]:
++        reference = obs.get("__task_primitive_reference")
++        self._task_primitive_reference = reference if isinstance(reference, str) else None
++        self._vlm_audit_dir = state.episode_log_dir
+         state.original_instruction = prompt
+         state.subgoals = []
+         state.current_subgoal_idx = 0

@@ -1,0 +1,27 @@
+.venv/
+.env
+.env_claude
+/no
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+benchmark/.external/
+benchmark/libero/logs/
+AGENTS.md
+
+# 独立上游或本地参考仓库；不复制进 RoboAgent 主仓库。
+
+pi/
+pi-py/
+HarnessVLA/
+HiMe/
+RoboMemArena/
+models/
+openpi/
+EmbodiSkill/
+EmbodiedSkills/
+sales-agent/
+evolution_workspaces/
+实验数据/

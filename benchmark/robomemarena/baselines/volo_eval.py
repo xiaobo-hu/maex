@@ -1,0 +1,154 @@
+"""基线评测层：连接原生 VoLo 代理，复用 RoboMemArena 客户端、评分与视频。"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import time
+from contextlib import ExitStack
+from pathlib import Path
+from uuid import uuid4
+
+import numpy as np
+
+from benchmark.libero._vendor.openpi_client import WebsocketPolicyClient
+from benchmark.robomemarena.baselines.volo_observation import build_volo_observation
+from benchmark.robomemarena.client.artifacts import write_official_artifacts
+from benchmark.robomemarena.client.observation import build_roboagent_observation
+from benchmark.robomemarena.client.remote_env import RemoteRoboMemArenaEnv
+from benchmark.robomemarena.client.video_recording import RoboMemArenaVideoRecorder
+from benchmark.robomemarena.config import RoboMemArenaConfig
+from roboagent.prompts.robomemarena import task_primitive_reference
+
+
+def execute_episode(env, policy, recorder, *, max_steps, action_chunk_size, trace_path,
+                    enable_depth=False, enable_task_reference=False) -> dict:
+    """执行单回合；发送显式回合标识与物理步数，不把官方阶段评分传给 VoLo。"""
+    raw = env.reset()
+    reference = task_primitive_reference(env.task_description) if enable_task_reference else None
+    if reference:
+        trace_path.with_name("task_reference.txt").write_text(reference + "\n", encoding="utf-8")
+    recorder.publish(build_roboagent_observation(raw))
+    episode_id = str(uuid4())
+    steps, calls, done = 0, 0, False
+    with trace_path.open("x") as trace:
+        while not done and steps < max_steps:
+            payload = build_volo_observation(raw, env.task_description, enable_depth=enable_depth)
+            payload.update({"__episode_id": episode_id, "__step": steps})
+            if reference:
+                # 静态参考进入任务分解，VLA prompt 仍由 VoLo 的当前子目标决定。
+                payload["__task_primitive_reference"] = reference
+            response = policy.infer(payload)
+            actions = np.asarray(response["actions"])
+            if (actions.ndim != 2 or actions.shape[1] != 7 or len(actions) == 0
+                    or not np.isfinite(actions).all()):
+                raise ValueError("VoLo must return nonempty finite actions [N, 7]")
+            calls += 1
+            selected = actions[:min(action_chunk_size, max_steps - steps)]
+            # 每次推理只使用新返回的 chunk，没有跨推理缓存需要 flush。
+            trace.write(json.dumps({
+                "event": "inference", "episode_id": episode_id, "step": steps,
+                "policy_call": calls, "actions": selected.tolist(),
+                **{key: value for key, value in response.items()
+                   if key.startswith("orchestrator_") and not key.endswith("_jpg")},
+            }, ensure_ascii=False, default=str) + "\n")
+            trace.flush()
+            for action in selected:
+                result = env.step(action)
+                raw, done = result.observation, result.done
+                steps += 1
+                recorder.publish(build_roboagent_observation(raw))
+                # done 后必须立刻停止，避免额外动作破坏终态。
+                if done:
+                    break
+            trace.write(json.dumps({"event": "chunk_end", "step": steps, "done": done}) + "\n")
+            trace.flush()
+    return {
+        "episode_id": episode_id, "policy_action_steps": steps, "policy_calls": calls,
+        "stop_reason": "environment_done" if done else "action_budget",
+        "task_reference_sha256": hashlib.sha256(reference.encode()).hexdigest() if reference else None,
+    }
+
+
+def main() -> int:
+    """运行一个 VoLo episode；错误独立记录，不将连接异常当成有效失败实验。"""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=50)
+    parser.add_argument("--max-steps", type=int, default=2500)
+    parser.add_argument("--action-chunk-size", type=int, default=5)
+    parser.add_argument("--enable-depth", action="store_true", help="Enable calibrated RGB-D for VoLo grasp tools")
+    parser.add_argument("--task-reference", action="store_true", help="Give decomposition the shared RoboMemArena primitive reference")
+    parser.add_argument("--env-host", default="127.0.0.1")
+    parser.add_argument("--env-port", type=int, default=8001)
+    parser.add_argument("--proxy-host", default="127.0.0.1")
+    parser.add_argument("--proxy-port", type=int, default=8040)
+    parser.add_argument("--run-dir", type=Path, required=True)
+    args = parser.parse_args()
+    if args.action_chunk_size < 1:
+        parser.error("--action-chunk-size must be positive")
+    config = RoboMemArenaConfig(task_id=args.task, seed=args.seed, max_steps=args.max_steps,
+                               enable_depth=args.enable_depth)
+    args.run_dir.mkdir(parents=True, exist_ok=False)
+    _write_json(args.run_dir / "run_config.json", {
+        **vars(args), "baseline": "VoLo-RGBD-RoboMemArena-adaptation" if args.enable_depth else "VoLo-Only-VLA-RoboMemArena-adaptation",
+        "environment_config": config.to_reset_params(), "external_skill": None,
+        "instruction": ("official task description plus shared static primitive reference for decomposition"
+                        if args.task_reference else "official task description without added primitive reference"),
+        "action_chunk_protocol": "5 by default, matching upstream LIBERO client",
+    })
+    env = None
+    resources = ExitStack()
+    recorder = RoboMemArenaVideoRecorder(args.run_dir / "videos", task_id=args.task)
+    outcome, evaluation, exit_code = {}, None, 0
+    started = time.monotonic()
+    try:
+        policy = WebsocketPolicyClient(args.proxy_host, args.proxy_port)
+        resources.callback(policy.close)
+        metadata = policy.get_server_metadata()
+        if metadata.get("orchestrator") is not True:
+            raise ValueError("--proxy-port must point to VoLo, not directly to a VLA")
+        _write_json(args.run_dir / "policy_metadata.json", metadata)
+        env = RemoteRoboMemArenaEnv(config, host=args.env_host, port=args.env_port)
+        resources.callback(env.close)
+        outcome = execute_episode(
+            env, policy, recorder, max_steps=args.max_steps,
+            action_chunk_size=args.action_chunk_size, trace_path=args.run_dir / "trace.jsonl",
+            enable_depth=args.enable_depth,
+            enable_task_reference=args.task_reference,
+        )
+    except KeyboardInterrupt:
+        exit_code = 130
+        outcome = {"stop_reason": "interrupted", "error_type": "KeyboardInterrupt"}
+    except Exception as exc:
+        exit_code = 1
+        outcome = {"stop_reason": "infrastructure_or_protocol_error", "error_type": type(exc).__name__}
+    finally:
+        try:
+            if env is not None:
+                evaluation = env.metrics()
+                write_official_artifacts(
+                    args.run_dir, task_id=args.task, seed=args.seed, prompt=env.task_description,
+                    evaluation=evaluation, video_dir=args.run_dir / "videos",
+                )
+        except Exception as exc:
+            outcome["finalization_error"] = type(exc).__name__
+            exit_code = 1
+        finally:
+            try:
+                outcome["videos"] = recorder.close(success=bool(evaluation and evaluation.get("TSR")))
+            finally:
+                resources.close()
+        outcome.update({"elapsed_s": time.monotonic() - started, "valid_rollout": exit_code == 0})
+        _write_json(args.run_dir / "result.json", outcome)
+    print(json.dumps(outcome, ensure_ascii=False))
+    return exit_code
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

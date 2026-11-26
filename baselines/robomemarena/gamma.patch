@@ -1,0 +1,100 @@
+diff --git a/rma/eval_stack/mme_rma_adapter.py b/rma/eval_stack/mme_rma_adapter.py
+index 5409c01..e0282f6 100644
+--- a/rma/eval_stack/mme_rma_adapter.py
++++ b/rma/eval_stack/mme_rma_adapter.py
+@@ -133,6 +133,16 @@ def _robosuite_quat2axisangle(quat: np.ndarray) -> np.ndarray:
+ SUBGOAL_PROVIDER = None
+ 
+ 
++class StatelessOpenPiClient(_websocket_client_policy.WebsocketClientPolicy):
++    """Keep GAMMA's observation history client-side for the stateless RMA policy."""
++
++    def reset(self):
++        return {"reset_finished": True}
++
++    def add_buffer(self, payload):
++        return {"add_buffer_finished": True}
++
++
+ class MMERMAAdapter(BasePolicyAdapter):
+     """Websocket adapter for a served mme_vla_suite RMA checkpoint."""
+ 
+@@ -179,7 +189,11 @@ class MMERMAAdapter(BasePolicyAdapter):
+         logger.info("MMERMAAdapter connecting to ws://%s:%s", self.host, self.port)
+         # WebsocketClientPolicy._wait_for_server() blocks/retries until the
+         # server accepts, so a slow JAX startup on the serving side is fine.
+-        self._client = _websocket_client_policy.MMEVLAWebsocketClientPolicy(self.host, self.port)
++        client_type = (
++            StatelessOpenPiClient if os.environ.get("GAMMA_STATELESS_OPENPI") == "1"
++            else _websocket_client_policy.MMEVLAWebsocketClientPolicy
++        )
++        self._client = client_type(self.host, self.port)
+         meta = self._client.get_server_metadata()
+         logger.info("MMERMAAdapter connected; server metadata=%s", meta)
+ 
+diff --git a/rma/rma_agent_server.py b/rma/rma_agent_server.py
+index 1e101cf..2146444 100644
+--- a/rma/rma_agent_server.py
++++ b/rma/rma_agent_server.py
+@@ -75,16 +75,27 @@ def norm(t): return re.sub(r"\s+", " ", t.strip().lower().rstrip("."))
+ s3proc = s3 = None
+ if not (SAM_OFF and A1_OFF and not VERIFY_VISION):
+     from transformers import Sam3Model, Sam3Processor
+-    s3proc = Sam3Processor.from_pretrained("facebook/sam3"); s3 = Sam3Model.from_pretrained("facebook/sam3", dtype=torch.bfloat16).to(DEV).eval()
++    sam_path = os.environ.get("GAMMA_SAM3_MODEL", "facebook/sam3")
++    s3proc = Sam3Processor.from_pretrained(sam_path)
++    if os.environ.get("GAMMA_SAM3_MODEL"):
++        from transformers import Sam3VideoModel
++        s3 = Sam3VideoModel.from_pretrained(sam_path, dtype=torch.bfloat16).detector_model.to(DEV).eval()
++    else:
++        s3 = Sam3Model.from_pretrained(sam_path, dtype=torch.bfloat16).to(DEV).eval()
+ agent = proc = None
+-if not A1_OFF:
++writer_url = os.environ.get("GAMMA_WRITER_URL")
++if not A1_OFF and writer_url:
++    from openai import OpenAI
++    writer = OpenAI(base_url=writer_url, api_key="local", timeout=120)
++elif not A1_OFF:
+     from transformers import AutoModelForImageTextToText, AutoProcessor
+     from peft import PeftModel
+     base = os.environ.get("WAM_BASE", "Qwen/Qwen3.5-9B"); ck = os.environ["A1_CKPT"]
+     proc = AutoProcessor.from_pretrained(base)
+     agent = AutoModelForImageTextToText.from_pretrained(base, dtype=torch.bfloat16).to(DEV)
+     agent = PeftModel.from_pretrained(agent, ck).eval()
+-print(f"[rma-agent] ready: sam={'OFF' if s3 is None else 'on'} verify_vision={VERIFY_VISION and s3 is not None} widths={len(WIDTHS)} writer={'OFF' if A1_OFF else os.environ.get('A1_CKPT')} harness={'OFF' if HARNESS_OFF else 'on'} port {PORT}", flush=True)
++writer_name = writer_url and os.environ["GAMMA_WRITER_MODEL"] or os.environ.get("A1_CKPT")
++print(f"[rma-agent] ready: sam={'OFF' if s3 is None else 'on'} verify_vision={VERIFY_VISION and s3 is not None} widths={len(WIDTHS)} writer={'OFF' if A1_OFF else writer_name} harness={'OFF' if HARNESS_OFF else 'on'} port {PORT}", flush=True)
+ 
+ @torch.no_grad()
+ def detect(pils, cands):
+@@ -110,9 +121,21 @@ def a1_write(rec, pils):
+     txt = user_of(rec); parts = txt.split("<image>")
+     content = [{"type": "text", "text": parts[0]}]
+     for i, p in enumerate(parts[1:]):
+-        if i < len(pils): content.append({"type": "image", "image": pils[i]})
++        if i < len(pils):
++            if writer_url:
++                with io.BytesIO() as image:
++                    pils[i].save(image, format="PNG")
++                    url = "data:image/png;base64," + base64.b64encode(image.getvalue()).decode("ascii")
++                content.append({"type": "image_url", "image_url": {"url": url}})
++            else:
++                content.append({"type": "image", "image": pils[i]})
+         content.append({"type": "text", "text": p})
+     msgs = [{"role": "system", "content": [{"type": "text", "text": SYS}]}, {"role": "user", "content": content}]
++    if writer_url:
++        result = writer.chat.completions.create(
++            model=os.environ["GAMMA_WRITER_MODEL"], messages=msgs, temperature=0, max_tokens=200,
++        )
++        return (result.choices[0].message.content or "").strip()
+     inp = proc.apply_chat_template([msgs], add_generation_prompt=True, enable_thinking=False, tokenize=True, return_dict=True, return_tensors="pt", padding=True).to(DEV)
+     out = agent.generate(**inp, max_new_tokens=200, do_sample=False, pad_token_id=proc.tokenizer.pad_token_id)
+     return proc.decode(out[0][inp["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+@@ -260,6 +283,6 @@ class H(BaseHTTPRequestHandler):
+             import traceback; traceback.print_exc(); self._send({"error": str(e)}, 500)
+ 
+ if __name__ == "__main__":
+-    srv = HTTPServer(("0.0.0.0", PORT), H)      # binds first: a port collision raises here, before any "listening" line
++    srv = HTTPServer((os.environ.get("GAMMA_HOST", "0.0.0.0"), PORT), H)
+     print(f"[rma-agent] listening on port {PORT} pid {os.getpid()}", flush=True)
+     srv.serve_forever()

@@ -1,0 +1,98 @@
+{
+  "protocol": {
+    "tasks": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26
+    ],
+    "seeds": [
+      100
+    ],
+    "chunk_steps": 10,
+    "warmup_steps": 10,
+    "max_policy_steps": 2500,
+    "post_goal_steps": 200,
+    "extra_pour_monitor_steps": 30,
+    "resize": 256,
+    "settle_ticks": 2
+  },
+  "source": {
+    "gamma": {
+      "commit": "4370cdcf176b7f6274dc4ce4a588166dfeff965f",
+      "patch_sha256": "dc42fd990b07e9a79d0f6517e456f0da4f5840083c98d10d45b952a570f1323a"
+    },
+    "robomemarena": {
+      "commit": "d09f63b671f362985e1e0d038d2014c2d2519488",
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "task_names": {
+    "1": "cookies_tomato_basket",
+    "2": "butter_popcorn_basket",
+    "3": "cream_pudding_basket",
+    "4": "drawer_butter",
+    "5": "butter_middle_drawer",
+    "6": "pour_tomato_sauce_into_bowl_drainer",
+    "7": "pour_tomato_sauce_into_frypan",
+    "8": "pick_chocolate_in_frypan_pour_tomato_sauce_twice",
+    "9": "pick_butter_in_frypan_pour_tomato_sauce_twice_and_place_tomato_sauce_in_bowl_drainer",
+    "10": "pour_wine_bottle_into_mug",
+    "11": "cookies_top_butter_middle",
+    "12": "cookies_chocolate_middle_drawer",
+    "13": "butter_cookies_middle_drawer",
+    "14": "cookies_chocolate_drawers",
+    "15": "butter_milk_frypan",
+    "16": "pour_milk_in_red_coffee_mug_twice_and_place_milk_in_bowl_drainer",
+    "17": "butter_chocolate_middle_drawer",
+    "18": "chocolate_butter_cabinet",
+    "19": "tomato_milk_orange_cabinet",
+    "20": "cookies_chocolate_microwave",
+    "21": "butter_chocolate_microwave",
+    "22": "pour_tomato_cookies_microwave",
+    "23": "cream_popcorn_microwave",
+    "24": "cookies_popcorn_microwave",
+    "25": "butter_cream",
+    "26": "chocolate_pudding_cream"
+  },
+  "agent_and_env_gpus": [
+    6,
+    6,
+    7,
+    7,
+    7,
+    7
+  ],
+  "vla_gpu": 6,
+  "qwen_gpus": [
+    4,
+    5
+  ],
+  "writer": "models/Qwen3.8-27B",
+  "detector": "models/sam3/model.safetensors",
+  "executor": "models/openpi/checkpoints/pi05_robomemarena",
+  "vla_labels": "baselines/GAMMA/rma/eval_stack/rma_their_labels.json",
+  "started_at_utc": "2026-11-25T17:58:14.523361+00:00"
+}

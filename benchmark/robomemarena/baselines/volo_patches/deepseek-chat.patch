@@ -1,0 +1,53 @@
+diff --git a/vlm_orchestrator/vlm/api.py b/vlm_orchestrator/vlm/api.py
+index aff8f87..4c4aec2 100644
+--- a/vlm_orchestrator/vlm/api.py
++++ b/vlm_orchestrator/vlm/api.py
+@@ -46,3 +46,3 @@ def is_reasoning_model(model: str) -> bool:
+ def chat_create(client, *, model: str, messages, temperature: float = 0.0,
+-                max_tokens: int | None = None, **extra):
++                max_tokens: int | None = None, audit_dir: str | None = None, **extra):
+     """Wrapper around `client.chat.completions.create` that picks the right
+@@ -79,3 +79,42 @@ def chat_create(client, *, model: str, messages, temperature: float = 0.0,
+             kwargs["max_tokens"] = max_tokens
+-    return client.chat.completions.create(**kwargs)
++    if model.rsplit("/", 1)[-1].startswith("deepseek-"):
++        # 闭环短响应不分配隐式思考预算，避免 512 token 全部消耗在 reasoning_content。
++        body = dict(kwargs.get("extra_body") or {})
++        body.setdefault("thinking", {"type": "disabled"})
++        kwargs["extra_body"] = body
++    # 记录真正提交 SDK 的正文（含原始图片 data URL），不读取 client 中的密钥。
++    import time
++    audit_path = None
++    audit = {"request": kwargs, "started_at": time.time()}
++    if audit_dir:
++        from pathlib import Path
++        from uuid import uuid4
++        try:
++            directory = Path(audit_dir) / "vlm_requests"
++            directory.mkdir(parents=True, exist_ok=True)
++            audit_path = directory / f"{uuid4().hex}.json"
++        except OSError as exc:
++            logger.warning("Cannot create VLM audit directory: %s", type(exc).__name__)
++    _write_chat_audit(audit_path, audit)
++    try:
++        response = client.chat.completions.create(**kwargs)
++    except Exception as exc:
++        audit["error_type"] = type(exc).__name__
++        audit["elapsed_s"] = time.time() - audit["started_at"]
++        _write_chat_audit(audit_path, audit)
++        raise
++    if audit_path is not None:
++        audit["elapsed_s"] = time.time() - audit["started_at"]
++        audit["response"] = response.model_dump(mode="json", exclude_none=True)
++        _write_chat_audit(audit_path, audit)
++    return response
++
++
++def _write_chat_audit(path, payload):
++    """仅记录请求正文与响应；日志写入失败不重试模型调用或改变决策。"""
++    if path is not None:
++        try:
++            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
++        except OSError as exc:
++            logger.warning("Cannot write VLM audit: %s", type(exc).__name__)
+ 

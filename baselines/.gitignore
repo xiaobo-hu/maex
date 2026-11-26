@@ -1,0 +1,9 @@
+# 上游源码由各自 Git 仓库管理，本目录保留本地论文与运行产物。
+/VoLoAgent/
+/GAMMA/
+/RPent/
+/REA/
+/*.pdf
+/.runtime/
+/runs/
+/robomemarena/.deps/

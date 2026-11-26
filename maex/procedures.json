@@ -1,0 +1,15 @@
+{
+  "version": "robomemarena-pi05-v23-pickup-fixture-evidence",
+  "executor": "pi05_robomemarena",
+  "templates": {
+    "held":   {"evidence": ["identity", "effect"], "recoveries": ["retry", "retreat"]},
+    "placed": {"evidence": ["identity", "release", "destination"], "recoveries": ["retry", "retreat"]},
+    "opened": {"evidence": ["identity", "effect", "aperture"], "recoveries": ["retry"]},
+    "closed": {"evidence": ["identity", "effect"], "recoveries": ["retry"]},
+    "poured": {
+      "evidence": ["identity", "effect", "upright"],
+      "recoveries": ["retry"],
+      "focus": "If checking a pickup, compare the latest front and wrist views with earlier views for lifting clear of the support. If only contact is visible or lifting cannot be determined, mark the pickup unknown."
+    }
+  }
+}
