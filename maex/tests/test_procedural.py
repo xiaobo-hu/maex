@@ -7,11 +7,11 @@ from pathlib import Path
 
 import pytest
 from maex.executor import PI05
-from maex.memory import IntentionTree, ProcedureLibrary
+from maex.memory import EpisodicMemory, IntentionTree, ProcedureLibrary
 from maex.models import Planner
 from maex.procedural import ProcedureStore, TaskContext
 from maex.reflector import publish_trace, recoveries_from_trace
-from maex.schema import ActiveTask, Goal, Plan
+from maex.schema import ActiveTask, BranchProposal, Goal, Plan, TreePatch
 
 from roboagent.types import Observation
 
@@ -80,6 +80,12 @@ def test_published_cases_are_retrieved_across_seeds_and_tasks(tmp_path) -> None:
     task_rule, = task_snapshot.recoveries
     assert task_rule.scope == "task" and task_rule.matches(0, goal, task_rule.condition)
     assert not task_rule.matches(1, goal, task_rule.condition)
+    task_tree = IntentionTree("current-task", Plan(goals=(goal,)), LIBRARY, task_snapshot)
+    task_active = ActiveTask(0, goal, 1, 1, 0, 0, PI05)
+    task_layer, = task_tree.request(1, task_active, EpisodicMemory()).frontier
+    assert task_layer.task_example.seed == 50 and task_layer.task_example.step == 0
+    assert task_layer.procedure_refs == (task_rule.reference(),)
+    assert task_tree.branches[0].recovery_procedure is None
     assert db.snapshot(task.model_copy(update={"seed": 50}), PI05, LIBRARY.version).exemplar is None
     assert db.snapshot(task.model_copy(update={"instruction": "Pick up butter."}), PI05, LIBRARY.version).exemplar is None
     assert db.snapshot(task, PI05, "incompatible").exemplar is None
@@ -100,6 +106,17 @@ def test_published_cases_are_retrieved_across_seeds_and_tasks(tmp_path) -> None:
     popcorn = Goal(predicate="held", target="popcorn", instruction=other.instruction)
     tree = IntentionTree("current", Plan(goals=(popcorn,)), LIBRARY, after)
     active = ActiveTask(0, popcorn, 1, 1, 0, 0, PI05)
+    memory = EpisodicMemory()
+    request = tree.request(1, active, memory)
+    assert request.experience_revision == after.revision
+    assert request.frontier[0].procedure_refs == (global_rule.reference(),)
+    assert tree.branches[0].task_example is None
+    proposal = BranchProposal(
+        step=0, focus="Check the grasp", recovery="retry", preferred_procedures=("other", global_rule.id),
+    )
+    assert tree.reconcile(request, TreePatch(branches=(proposal,)), memory) == {0: "attached_with_filtered_procedures"}
+    assert tree.branches[0].preferred_procedures == (global_rule.id,)
+    assert tree.branches[0].recovery_procedure is None
     mismatched = global_rule.condition.model_copy(update={"jaws": "empty_closed"})
     assert tree.prepare_recovery(active, mismatched) is None
     assert tree.prepare_recovery(active, global_rule.condition) == global_rule

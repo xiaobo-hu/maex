@@ -1,7 +1,7 @@
 # HiMe-Same-Backbone 接入实验
 
 `hime_eval.py` 在独立进程中直接组合本地原版 HiMe 的 `ServerTaskManager`、
-Planner、Sentry、`MultiTagMemory` 和两轮记忆协议。原 `HiMe/` 源码不修改；
+Planner、Sentry、`MultiTagMemory` 和两轮记忆协议。上游在 `baselines/HiMe/`；
 每个 episode 构造全新的记忆实例，不使用 resume，也不进入 RoboAgent runtime。
 改动仅包括任务 prompt、模型服务参数、相机/VLA 接口和评测生命周期。
 
@@ -16,15 +16,22 @@ rollout 无效，需要从 reset 重新运行；不从中断动作步恢复。
 
 ## 准备与运行
 
-依赖已有的 `HiMe/` checkout、OpenPI checkpoint、Qwen 权重、项目 `.venv` 和
-`roboagent-robomemarena` conda 环境。当前机器的 `.venv` 为 Python 3.13，已验证可导入
-HiMe；本地 embedding 另使用该环境现有的 torch、transformers 和 huggingface_hub。
-不需要 ROS、Widow 机器人客户端或 HiMe HTTP 服务。
+依赖 `baselines/HiMe/.venv` 的 Python 3.13 环境、OpenPI checkpoint、Qwen 权重及
+`roboagent-robomemarena` 仿真环境。本地 MiniLM 使用 CPU PyTorch 和 Transformers。
+在仓库根目录安装时使用以下命令。
+
+```bash
+uv sync --project baselines/HiMe --python 3.13
+uv pip install --python baselines/HiMe/.venv/bin/python 'torch==2.9.1+cpu' \
+  --index https://download.pytorch.org/whl/cpu
+uv pip install --python baselines/HiMe/.venv/bin/python 'openai<3' 'transformers<5' \
+  opencv-python-headless websockets msgpack PyYAML anthropic jsonschema json-repair
+```
 
 默认配置使用本地文本 embedding 进行接入试跑。首次下载：
 
 ```bash
-.venv/bin/python - <<'PY'
+baselines/HiMe/.venv/bin/python - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download(
     "sentence-transformers/all-MiniLM-L6-v2",
@@ -136,6 +143,12 @@ Planner 格式适配 `xml-summary-status-v1` 在接入层将误嵌套或漏闭�
 
 ## 产物与验证
 
+论文对照使用 DeepSeek `deepseek-flash`、本地 `Qwen/Qwen3.8-27B` 和冻结的 `pi05_robomemarena`。
+每局以 900 秒、2,500 步、20 Hz、Planner 20 次、Sentry 100 次为上限，
+实际发送的 VLA 请求时间与首帧、终止时间记录在 `trace.json`。
+在仓库根目录运行该评测归档的 `provenance/run_and_report.sh` 可补跑缺失的 task/seed，
+完成 260 局后核对评分与视频并生成 `report.md` 和 `metrics.csv`。
+
 启动脚本将产物保存到 `logs/hime/task*-seed*-*/episode/`，包括：
 
 - `run_config.json`、`policy_metadata.json`：模型、预算、原 HiMe revision/源码指纹；
@@ -145,9 +158,9 @@ Planner 格式适配 `xml-summary-status-v1` 在接入层将误嵌套或漏闭�
 - `videos/`：动作执行期间的 external/wrist 视频；
 - `evaluation.json`、`episodes.tsv` 等官方格式成绩，以及 `result.json` 的运行有效性标记。
 
-API、模型解析或接线错误退出码为 1，`result.json.valid_rollout=false`；已执行部分的评分
-仅作为诊断保留。正常预算耗尽属于有效失败运行。300 步测试只是接线验证，不能与 2500 步
-正式结果混合汇总。单 seed 的一次 Task 1 运行也不代表 26 任务成功率。
+基础设施故障退出码为 1，`result.json.valid_rollout=false`，评分作为诊断保留。
+任务失败、模型预算耗尽和控制超时保留官方部分评分，计入正式结果。
+接线测试的短预算数据另行保存。
 
 ```bash
 .venv/bin/python -m pytest -q benchmark/robomemarena/tests/test_hime_baseline.py

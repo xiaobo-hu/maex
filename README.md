@@ -44,6 +44,8 @@ RoboMemArena 执行并记录官方评分。旧分支的 `harness_eval` 仍独立
 冻结 VLA。独立入口保存官方评分与模型用量，每个 episode 初始化空记忆。
 HiMe 的模型连接错误最多重试两次，所有尝试均计入请求预算并单独记录。
 HiMe 接入层修正已知的 summary 标签嵌套/漏闭合及中文计划状态标签，保留原始响应并记录格式适配版本；不增加模型轮次或改写动作内容。
+HiMe 上游位于 `baselines/HiMe`，使用独立 Python 3.13 环境。论文对照启用 900 秒和 2,500 步预算，
+记录实际 Planner 阻塞区间与 VLA WebSocket 请求。环境与复跑方式见 [HiMe 评测说明](benchmark/robomemarena/baselines/HIME.md)。
 RoboMemArena 自动启动脚本明确使用仿真 Conda 环境的 Python，支持在已激活项目 `.venv` 的终端运行。
 环境构造和正式 reset 前均设置任务 seed，避免构造阶段使用未受控的随机摆放。
 
@@ -514,6 +516,8 @@ VoLoAgent 的独立依赖安装、SAM3＋GraspGen 抓取（放置使用 VLA）�
 后续运行在 episode 的 `vlm_requests/` 保存实际 VLM 请求与响应，不记录客户端凭据。
 VoLo 监控沿用上游 LIBERO 的 40 个控制步间隔；在当前 20 Hz 环境下为每 2 秒仿真时间一次
 （0.5 Hz），可通过 `VOLO_CHECK_INTERVAL` 覆盖，实际耗时取决于推理与仿真速度。
+论文对照从 `baselines/VoLoAgent` 的独立环境启动，使用 DeepSeek 规划、Qwen3.8-27B 监控和共享 π₀.₅。
+评测预算、请求时序和恢复入口见 [VoLo 论文对照](benchmark/robomemarena/baselines/VOLO.md#论文对照)。
 
 RoboMemArena 使用相同的只读 Observer 契约，但环境和 policy 配置独立。以下命令分别在四个
 终端运行；不需要 Observer 日志时可省略终端 3 和终端 4 的 `--observer-*` 参数。

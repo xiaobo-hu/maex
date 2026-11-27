@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import TYPE_CHECKING, TypeVar
 
 from openai import AsyncOpenAI
@@ -72,13 +73,19 @@ $drawer, and close $drawer. Use the actual object name in the placement instruct
 Leave drawer_selection null for all other tasks. Existing visible state can inform grounding.
 The descriptions and images are inputs only. Plan goals, not facts about future effects."""
 
-EXPANSION_PROMPT = """Complete the local outcome branches for MAEX using the supplied tool.
-Only address the listed step indices. Keep their identity, destination, order and action
-unchanged. For each step describe a visual landmark or ambiguity that may help diagnose
-stalled execution. Choose retry or retreat for a confirmed
-deviation. Retreat is only a candidate and requires fresh evidence of a clear corridor.
-When the result is uncertain, the executive inspects existing views. Do not propose new
-actions, unsupported tools, coordinates, goals or claims about future observations."""
+EXPANSION_PROMPT = """Complete the local outcome tree for MAEX using the supplied tool.
+Each layer has a fixed success edge to the next goal, a deviation edge to recovery and
+verification, and an uncertain edge to inspection of that same goal. The listed parent
+steps are prerequisites, not confirmed observations. The supplied image is from the
+anchor's current state. Future goals and unresolved slots remain conditional.
+
+Return a proposal only for indices in expand_steps. Keep identity, destination, order
+and action unchanged. Write focus as a short diagnostic question for recovery and
+inspect_focus as a short question for disambiguating an uncertain result. Choose one
+allowed recovery. Retreat requires fresh evidence of a clear corridor. Choose IDs for
+preferred_procedures only from the same step's procedure_refs. Use an empty list when
+that step has no compatible reference. Conditions are checked later. Do not invent IDs,
+tools, coordinates, effects, or scene claims about future steps."""
 
 VERIFY_PROMPT = """You are a read-only perception module for a robot. Evaluate each listed
 step from the ordered real images, with actual gripper feedback provided as context.
@@ -261,12 +268,28 @@ class Planner:
     async def expand(
         self, task: str, request: PlanRequest, facts: tuple[Fact, ...], observation: Observation,
     ) -> tuple[TreePatch, Usage]:
-        """按请求快照补全两步内的后继与证据查询。"""
+        """按冻结前沿补全多层结果分支，只向模型展示经验目录。"""
+        steps = [step for step, _, _ in request.dependencies]
         snapshot = {
             "task": task,
             "anchor": request.anchor,
-            "steps": [
-                {"step": step, **goal.model_dump(mode="json")} for step, goal, _ in request.dependencies
+            "expand_steps": steps,
+            "frontier": [
+                {
+                    "step": node.step,
+                    "goal": node.goal.model_dump(mode="json"),
+                    "requires_verified_step": node.predecessor,
+                    "binding_pending": node.binding_pending,
+                    "true": {"next_step": node.successor},
+                    "false": {
+                        "allowed_recovery": node.recoveries,
+                        "verify_after": node.step,
+                        "procedure_refs": [asdict(ref) for ref in node.procedure_refs] if node.step in steps else [],
+                    },
+                    "unknown": {"inspect": node.step, "verify_after": node.step},
+                    "task_example": asdict(node.task_example) if node.task_example is not None else None,
+                }
+                for node in request.frontier
             ],
             "confirmed_events": [
                 {"step": fact.step, "predicate": fact.goal.predicate, "target": fact.goal.target,

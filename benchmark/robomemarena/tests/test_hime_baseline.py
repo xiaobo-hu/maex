@@ -55,7 +55,7 @@ def xml(operations, plan=""):
 
 @pytest.mark.parametrize("last_status,fallback", [("not_done", 2), ("done", 50)])
 def test_upstream_two_turn_memory_sentry_fallback_and_isolation(tmp_path, monkeypatch, last_status, fallback):
-    root = PROJECT_ROOT / "HiMe"
+    root = PROJECT_ROOT / "baselines/HiMe"
     if not (root / "server/task_manager.py").exists():
         pytest.skip("Original HiMe checkout is required for this integration test")
     monkeypatch.chdir(tmp_path)

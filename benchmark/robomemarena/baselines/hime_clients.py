@@ -12,6 +12,9 @@ from pathlib import Path
 
 import numpy as np
 from openai import APIConnectionError
+from websockets.sync.client import connect
+
+from benchmark.libero._vendor.openpi_client import msgpack_numpy
 
 CONNECTION_RETRY_DELAYS_S = (2, 4)
 PLANNER_FORMAT_REVISION = "xml-summary-status-v1"
@@ -49,6 +52,41 @@ def normalize_planner_format(text: str) -> str:
 
 class ModelBudgetExceededError(RuntimeError):
     """模型请求达到预先声明的预算。"""
+
+
+class ModelOutputLimitError(RuntimeError):
+    """模型用完本次响应的输出 token 预算。"""
+
+
+class HiMePolicyClient:
+    """连接常驻 π0.5，并按消息成功发出的时间记录 VLA 调用。"""
+
+    def __init__(self, host: str, port: int, *, task: int, seed: int) -> None:
+        self.socket = connect(
+            f"ws://{host}:{port}", compression=None, max_size=None, open_timeout=60,
+            additional_headers={"X-MAEX-Episode-Seed": str(seed), "X-MAEX-Task": str(task)},
+        )
+        try:
+            self.metadata = msgpack_numpy.unpackb(self.socket.recv(timeout=60))
+        except Exception:
+            self.socket.close()
+            raise
+        self.packer = msgpack_numpy.Packer()
+        self.sent_at: list[float] = []
+
+    def infer(self, observation: dict[str, object]) -> dict[str, object]:
+        self.socket.send(self.packer.pack(observation))
+        self.sent_at.append(time.monotonic())
+        response = self.socket.recv(timeout=45)
+        if isinstance(response, str):
+            raise RuntimeError(f"OpenPI inference failed: {response}")
+        return msgpack_numpy.unpackb(response)
+
+    def get_server_metadata(self) -> dict:
+        return self.metadata
+
+    def close(self) -> None:
+        self.socket.close()
 
 
 class HiMeChatClient:
@@ -117,18 +155,21 @@ class HiMeChatClient:
             "messages": logged_messages,
         }
         started = time.monotonic()
+        record["started_at"] = started
         try:
             kwargs = {"extra_body": self.extra_body} if self.extra_body is not None else {}
             response = self.client.chat.completions.create(
                 model=self.model, messages=wire_messages, max_tokens=self.max_tokens, **kwargs,
             )
+            ended = time.monotonic()
             text = response.choices[0].message.content or ""
             record.update(
-                response=text, finish_reason=response.choices[0].finish_reason,
+                response=text, response_model=getattr(response, "model", None),
+                finish_reason=response.choices[0].finish_reason, ended_at=ended,
                 usage=response.usage.model_dump() if response.usage else None,
             )
             if response.choices[0].finish_reason == "length":
-                raise RuntimeError(f"{self.role} response truncated at the output token limit")
+                raise ModelOutputLimitError(f"{self.role} response truncated at the output token limit")
             if self.role == "planner":
                 normalized = normalize_planner_format(text)
                 if normalized != text:
@@ -141,7 +182,8 @@ class HiMeChatClient:
             record["error_type"] = type(exc).__name__
             raise
         finally:
-            record["elapsed_s"] = time.monotonic() - started
+            record.setdefault("ended_at", time.monotonic())
+            record["elapsed_s"] = record["ended_at"] - started
             with self.log_path.open("a") as output:
                 output.write(json.dumps(record, ensure_ascii=False) + "\n")
 

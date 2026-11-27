@@ -70,7 +70,9 @@ wait_for_service "$POLICY_PORT" policy websocket
 wait_for_service "$ENV_PORT" environment websocket
 wait_for_service "$OBSERVER_PORT" observer http
 
-.venv/bin/python -u -m benchmark.robomemarena.baselines.hime_eval \
+PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/agent:$PROJECT_ROOT/agent/agent-core${PYTHONPATH:+:$PYTHONPATH}" \
+  "${HIME_PYTHON:-$PROJECT_ROOT/baselines/HiMe/.venv/bin/python}" -u \
+  -m benchmark.robomemarena.baselines.hime_eval \
   --task "$TASK_ID" --seed "$SEED" --max-steps "$MAX_STEPS" \
   --policy-port "$POLICY_PORT" --env-port "$ENV_PORT" \
   --sentry-base-url "http://127.0.0.1:$OBSERVER_PORT/v1" \

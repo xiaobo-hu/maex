@@ -13,6 +13,27 @@ LIBERO 抓取原生使用末端闭环，不经过 cuRobo 关节规划；配置�
 当前结果尚不构成与 RoboAgent 的公平配对对照；完整提示、任务信息及预算差异见
 [公平性审计](VOLO_FAIRNESS_AUDIT.md)。
 
+## 论文对照
+
+论文批次使用 `baselines/VoLoAgent` 的 Python 3.11 环境。环境依赖可从仓库根目录安装。
+
+```bash
+uv venv --python 3.11 baselines/VoLoAgent/.venv
+uv pip install --python baselines/VoLoAgent/.venv/bin/python \
+  -e baselines/VoLoAgent 'websockets==15.0.1'
+```
+
+评测采用原生 `subgoal`、VLM 监控和 `replan`，以双视角 RGB 和共享静态任务原语参考作为输入。
+深度、GraspGen 与分割工具在该配置下关闭。DeepSeek `deepseek-flash` 负责初始分解和重规划，
+本地 `Qwen/Qwen3.8-27B` 每隔 40 个物理步监控，所有动作由冻结的 `pi05_robomemarena` 执行。
+模型路由补丁只应用到该批次的 VoLo 源码快照。
+
+每局上限为 900 秒、2,500 步、Planner 20 次与 Observer 100 次，目标控制频率 20 Hz，
+π₀.₅ 每次请求最多执行 20 步。`requests.jsonl` 保存 Planner 与 Observer 的 API 时序及代理后端
+真实发出的 VLA 请求。`trace.json` 保存正式计时边界和官方评分。
+在仓库根目录运行该批次归档中的 `provenance/run_and_report.sh` 可恢复缺失的 Task/seed，
+并在 260 局齐全后重新生成汇总。 [实验口径](../../../paper_result/MAEX_RoboMemArena_实验规划与指标.md)
+
 ## 源码与独立依赖
 
 官方仓库：<https://github.com/NVlabs/VoLoAgent>。

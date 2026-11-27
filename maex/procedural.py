@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from roboagent.types import Observation
 
 from .memory import CLOSED_GRIP_M, OPEN_GRIP_M, gripper_width
-from .schema import ExecutionMode, Goal, Outcome, Plan, Predicate
+from .schema import ExecutionMode, Goal, Outcome, Plan, Predicate, ProcedureReference
 
 ReusableAction = Literal[
     "open_gripper", "close_gripper", "release_gripper", "pull_drawer", "restage_vla",
@@ -69,7 +69,7 @@ class RecoveryCondition(BaseModel):
         else:
             jaws = "intermediate"
         return cls(
-            predicate=goal.predicate, drawer=goal.is_drawer_motion or goal.destination.casefold().endswith("drawer"),
+            predicate=goal.predicate, drawer=uses_drawer(goal),
             mode=mode, jaws=jaws, outcome=outcome, lost_pickup=lost_pickup, blocked_by=blocked_by,
         )
 
@@ -119,11 +119,36 @@ class RecoveryProcedure:
     task_step: int | None
     task_goal: Goal | None
 
+    def applies_to(self, step: int, goal: Goal) -> bool:
+        """只按静态角色过滤目录，保留尚待绑定的槽位和当前条件。"""
+        if self.condition.predicate != goal.predicate:
+            return False
+        if goal.destination_from is None and self.condition.drawer != uses_drawer(goal):
+            return False
+        if self.task_goal is None:
+            return True
+        return (
+            self.task_step == step
+            and self.task_goal.occurrence == goal.occurrence
+            and (goal.target == "$drawer" or goal.target.casefold() == self.task_goal.target.casefold())
+            and (goal.destination_from is not None or goal.destination == "$drawer"
+                 or goal.destination.casefold() == self.task_goal.destination.casefold())
+        )
+
+    def reference(self) -> ProcedureReference:
+        """为树节点提供简短目录项。"""
+        return ProcedureReference(self.id, self.scope, self.action, self.condition.outcome, self.support)
+
     def matches(self, step: int, goal: Goal, condition: RecoveryCondition) -> bool:
         """在当前步骤和绑定已知时实例化可执行的恢复候选。"""
         return self.condition == condition and (
             self.task_goal is None or (self.task_step == step and goal_roles(self.task_goal) == goal_roles(goal))
         )
+
+
+def uses_drawer(goal: Goal) -> bool:
+    """识别抽屉目标或抽屉目的地，包括待绑定的抽屉槽位。"""
+    return goal.is_drawer_motion or goal.destination.casefold().endswith("drawer")
 
 
 def goal_roles(goal: Goal) -> tuple[Predicate, str, str, int]:

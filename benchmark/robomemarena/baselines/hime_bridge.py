@@ -10,6 +10,10 @@ from PIL import Image
 from benchmark.robomemarena.preprocessing import build_policy_input
 
 
+class HiMePlanError(RuntimeError):
+    """HiMe 未生成可执行的计划。"""
+
+
 class HiMeSession:
     """一个 episode 独享的 HiMe；不注入 RoboAgent 的计划或观察逻辑。"""
 
@@ -48,7 +52,7 @@ class HiMeSession:
         self.state = None
 
     def start(self, instruction: str, raw: dict):
-        """从初始相机帧启动原有两轮规划，记忆在构造时已隔离。"""
+        """从初始相机帧启动原有初始规划，记忆在构造时已隔离。"""
         main, wrist = self.frames(raw)
         self.state = self.manager.create_task(
             global_instruction=instruction, config=self.config,
@@ -87,9 +91,9 @@ class HiMeSession:
             raise RuntimeError("Embedding failed inside HiMe; see embedding_calls.jsonl")
         # 原版把空计划解释为 done；记录为接口失败，不能算成功或额外修正计划。
         if not self.state.plan_list.strip():
-            raise RuntimeError("HiMe returned an empty plan")
+            raise HiMePlanError("HiMe returned an empty plan")
         if self.state.is_done:
             from extractor import is_plan_done
 
             if not is_plan_done(self.state.plan_list):
-                raise RuntimeError("HiMe stopped without a completed plan")
+                raise HiMePlanError("HiMe stopped without a completed plan")

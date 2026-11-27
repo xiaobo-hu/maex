@@ -39,6 +39,7 @@ from .schema import (
     ExecutionMode,
     Facet,
     Fact,
+    Goal,
     Judgment,
     Outcome,
     PlanRequest,
@@ -177,7 +178,7 @@ class Executive:
         self.completed_chunks = 0
         self.goal_anchor = executor.latest
         self.attempts: dict[int, int] = {}
-        self.expanded: set[int] = set()
+        self.expanded: set[tuple[int, Goal, int]] = set()
         self.retreated: set[int] = set()
         self.boundary_recoveries: set[tuple[int, int, ExecutionMode]] = set()
         self.last_recovery_at: tuple[int, int, int] | None = None
@@ -573,7 +574,7 @@ class Executive:
     def review_execution(self, task: str, active: ActiveTask, *, validation_feedback: str = "") -> None:
         """在动作边界复查未决或停滞，沿用整个 episode 的剩余预算。"""
         assert self.tree is not None
-        branch = self.tree.branches[active.step]
+        branch = self.tree.branch_for(active.step, self.memory)
         current = self.working.latest
         end, check = self.memory.latest_checks.get(active.step, (-1, Check(Outcome.UNKNOWN, "")))
         if ((branch.recovery == "retreat" or active.step < self.memory.progress)
@@ -605,7 +606,8 @@ class Executive:
         attempts = [asdict(report) for report in self.memory.attempts.get(active.step, ())]
         grasp_reference = self.memory.grasp_references.get(lost_pickup) if lost_pickup is not None else None
         procedure = None
-        if self.procedures is not None and active.step == progress and not validation_feedback:
+        if (self.procedures is not None and active.step == progress
+                and branch.bound_goal == active.goal and not validation_feedback):
             condition = RecoveryCondition.observe(
                 active.goal, active.mode, current.observation,
                 check.outcome if end == current.sequence else Outcome.UNKNOWN, lost_pickup is not None, blocker,
@@ -614,7 +616,8 @@ class Executive:
             if procedure is not None:
                 self.log("procedure_retrieved", id=procedure.id, scope=procedure.scope, use="recovery",
                          revision=self.procedures.revision, goal_step=active.step, epoch=active.epoch,
-                         action=procedure.action, source_episodes=procedure.source_episodes)
+                         action=procedure.action, source_episodes=procedure.source_episodes,
+                         expansion_request=branch.request_id, preferred=procedure.id in branch.preferred_procedures)
         self.recovery_snapshot = active, current.sequence, task, validation_feedback, procedure
         self.log("recovery_requested", goal_step=active.step, epoch=active.epoch,
                  attempt=active.attempt, robot_state=current.observation.robot_state,
@@ -778,7 +781,7 @@ class Executive:
         return ActiveTask(
             step, goal, self.attempts.get(step, 0) + int(mode == "policy"),
             active.epoch + 1 if active else 1, self.working.latest.sequence,
-            self.tree.branches[step].revision, PI05, mode,
+            self.tree.bind_branch(step, goal).revision, PI05, mode,
         )
 
     def transition(self, step: int, mode: ExecutionMode = "policy") -> bool:
@@ -877,14 +880,17 @@ class Executive:
         return False
 
     def expand(self, task: str) -> None:
-        """从单个在途前沿异步补全尚缺的观察与恢复分支。"""
+        """近端覆盖不足时异步补全多层分支，预留恢复预算。"""
         assert self.tree is not None and self.executor.active is not None
         active = self.executor.active
-        if active.step in self.expanded or "expand" in self.jobs or self.planner_count >= self.limits.planner_calls:
+        if "expand" in self.jobs or self.planner_count + 1 >= self.limits.planner_calls:
             return
-        self.expanded.add(active.step)
+        request = self.tree.request(self.planner_count + 1, active, self.memory, self.expanded)
+        if not request.dependencies or request.dependencies[0][0] > active.step + 1:
+            return
+        self.expanded.update(request.dependencies)
         self.planner_count += 1
-        self.expansion = self.tree.request(self.planner_count, active, self.memory)
+        self.expansion = request
         self.log("expansion_requested", **asdict(self.expansion))
         self.start_job("expand", self.planner.expand(
             task, self.expansion, tuple(self.memory.facts.values()), self.working.latest.observation,
@@ -904,7 +910,7 @@ class Executive:
             return False
         self.record_drawer_pull(active)
         goals = [(active.step, active.goal)]
-        branch = self.tree.branches[active.step]
+        branch = self.tree.branch_for(active.step, self.memory)
         next_step = branch.successor
         if active.goal.predicate in {Predicate.HELD, Predicate.POURED} and next_step is not None:
             successor = self.tree.goal(next_step, self.memory)
@@ -945,6 +951,13 @@ class Executive:
                 )
         predicates = dict.fromkeys(goal.predicate for _, goal in goals)
         focus = " ".join(self.library.templates[predicate].focus for predicate in predicates).strip()
+        check_at, check = self.memory.latest_checks.get(active.step, (-1, Check(Outcome.UNKNOWN, "")))
+        inspect_focus = ""
+        if (inspect and pickup is None and recheck_step is None and branch.bound_goal == active.goal
+                and (check_at != end or check.outcome == Outcome.UNKNOWN)):
+            inspect_focus = branch.inspect_focus
+        if inspect_focus:
+            focus = f"{focus} Inspection question for step {active.step}: {inspect_focus}".strip()
         if recheck_step is not None:
             previous_step, previous = self.memory.latest_checks[recheck_step]
             if previous_step == end and previous.outcome == Outcome.FALSE:
@@ -995,6 +1008,7 @@ class Executive:
                  mode=branch.unresolved if inspect else "verify", focus=focus, clearance=clearance,
                  inspect_drawer=self.window.inspect_drawer, pickup_review=pickup.step if pickup is not None else None,
                  recheck_step=recheck_step,
+                 expansion_request=branch.request_id if inspect_focus else None,
                  fixture_reference=fixture_reference.sequence if fixture_reference is not None else None,
                  identity_reference=self.window.identity_reference.sequence if self.window.identity_reference else None)
         self.start_job("verify", self.observer.verify(window))

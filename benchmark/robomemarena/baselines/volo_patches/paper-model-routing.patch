@@ -1,0 +1,94 @@
+--- a/vlm_orchestrator/strategies/subgoal_base.py
++++ b/vlm_orchestrator/strategies/subgoal_base.py
+@@ -558,7 +558,7 @@
+         primary_label, extra_labels = self.ctx.vlm_camera_labels
+ 
+         self._failure_handler = VLMFailureHandler(
+-            vlm_call_fn=self._vlm_call,
++            vlm_call_fn=self._observer_vlm_call,
+             image_builder_fn=self._build_check_message,
+             get_vlm_image_fn=self.ctx.get_vlm_image,
+             get_extra_images_fn=self.ctx.get_vlm_extra_images,
+@@ -608,18 +608,22 @@
+             self._client = openai.OpenAI(**kwargs)
+         return self._client
+ 
++    def _observer_vlm_call(self, system_prompt: str, user_content: list[dict]) -> str:
++        return self._vlm_call(system_prompt, user_content, role="observer")
++
+     def _vlm_call(
+         self,
+         system_prompt: str,
+         user_content: list[dict],
+         max_tokens: int | None = None,
++        *,
++        role: str = "planner",
+     ) -> str:
+         """Single VLM call via the OpenAI-compatible backend.
+ 
+         *max_tokens* overrides the default ``config.vlm_max_tokens``
+         for calls that need more room (e.g. recycle with many subgoals).
+         """
+-        from vlm_orchestrator.vlm import chat_create
+         reference = getattr(self, "_task_primitive_reference", None)
+         if reference:
+             # 同一任务的静态参考供分解、监控和重规划使用；不作为场景状态证据。
+@@ -631,10 +635,8 @@
+                 "Preserve the actual task's objects, destinations, counts, and conditions "
+                 "when they conflict with a legacy label or note."
+             )
+-        response = chat_create(
+-            self.client,
+-            model=self.config.vlm_model,
+-            temperature=self.config.vlm_temperature,
++        response = self.request_vlm(
++            role,
+             max_tokens=max_tokens or self.config.vlm_max_tokens,
+             audit_dir=getattr(self, "_vlm_audit_dir", None),
+             messages=[
+@@ -649,6 +651,14 @@
+                 f"({max_tokens or self.config.vlm_max_tokens})"
+             )
+         return choice.message.content.strip()
++
++    def request_vlm(self, role, *, messages, max_tokens, audit_dir):
++        from vlm_orchestrator.vlm import chat_create
++
++        return chat_create(
++            self.client, model=self.config.vlm_model, temperature=self.config.vlm_temperature,
++            messages=messages, max_tokens=max_tokens, audit_dir=audit_dir,
++        )
+ 
+     # ------------------------------------------------------------------
+     # Message builders
+--- a/vlm_orchestrator/vlm/api.py
++++ b/vlm_orchestrator/vlm/api.py
+@@ -44,7 +44,8 @@
+ 
+ 
+ def chat_create(client, *, model: str, messages, temperature: float = 0.0,
+-                max_tokens: int | None = None, audit_dir: str | None = None, **extra):
++                max_tokens: int | None = None, audit_dir: str | None = None,
++                on_request=None, **extra):
+     """Wrapper around `client.chat.completions.create` that picks the right
+     parameter set for reasoning vs standard chat models. All call sites should
+     use this so a single check covers every VLM call path.
+@@ -96,6 +97,8 @@
+         except OSError as exc:
+             logger.warning("Cannot create VLM audit directory: %s", type(exc).__name__)
+     _write_chat_audit(audit_path, audit)
++    if on_request is not None:
++        on_request("start", time.monotonic())
+     try:
+         response = client.chat.completions.create(**kwargs)
+     except Exception as exc:
+@@ -103,6 +106,9 @@
+         audit["elapsed_s"] = time.time() - audit["started_at"]
+         _write_chat_audit(audit_path, audit)
+         raise
++    finally:
++        if on_request is not None:
++            on_request("end", time.monotonic())
+     if audit_path is not None:
+         audit["elapsed_s"] = time.time() - audit["started_at"]
+         audit["response"] = response.model_dump(mode="json", exclude_none=True)

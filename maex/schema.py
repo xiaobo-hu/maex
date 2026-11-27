@@ -11,6 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from roboagent.observer.types import ObservationEvent
 
+LOOKAHEAD_STEPS = 3
+LOOKAHEAD_PROCEDURES = 3
+
 
 class Predicate(StrEnum):
     """首版执行器能够验证的目标谓词。"""
@@ -152,14 +155,23 @@ class BranchProposal(BaseModel):
     step: int = Field(ge=0)
     focus: str = Field(min_length=1, max_length=240)
     recovery: Literal["retry", "retreat"]
+    inspect_focus: str = Field(default="", max_length=200)
+    preferred_procedures: tuple[str, ...] = Field(default=(), max_length=LOOKAHEAD_PROCEDURES)
 
 
 class TreePatch(BaseModel):
-    """一至两个步骤的局部补全。"""
+    """对有限物理步骤展开的结果分支补丁。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    branches: tuple[BranchProposal, ...] = Field(max_length=2)
+    branches: tuple[BranchProposal, ...] = Field(max_length=LOOKAHEAD_STEPS)
+
+    @model_validator(mode="after")
+    def unique_steps(self) -> TreePatch:
+        """每步只接续一份结果结构。"""
+        if len({branch.step for branch in self.branches}) != len(self.branches):
+            raise ValueError("Each expanded step must have exactly one branch proposal")
+        return self
 
 
 class VisualSupport(BaseModel):
@@ -292,6 +304,40 @@ class Fact:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcedureReference:
+    """恢复经验的目录项。实际进入条件及原轨迹保存在固定快照中。"""
+
+    id: str
+    scope: Literal["task", "global"]
+    action: RecoveryAction
+    outcome: Outcome
+    support: int
+
+
+@dataclass(frozen=True, slots=True)
+class TaskStepReference:
+    """同一任务另一 seed 的已核验计划步骤。"""
+
+    episode_id: str
+    seed: int
+    step: int
+
+
+@dataclass(frozen=True, slots=True)
+class FrontierNode:
+    """当前或未来一步的结果分叉与结构依赖。"""
+
+    step: int
+    goal: Goal
+    predecessor: int | None
+    successor: int | None
+    binding_pending: bool
+    recoveries: tuple[Literal["retry", "retreat"], ...]
+    procedure_refs: tuple[ProcedureReference, ...]
+    task_example: TaskStepReference | None
+
+
+@dataclass(frozen=True, slots=True)
 class PlanRequest:
     """绑定在途扩展的锚点与有权更新的后继。"""
 
@@ -304,3 +350,5 @@ class PlanRequest:
     procedures: str
     # 结构依赖包括原始语义目标和候选分支版本。
     dependencies: tuple[tuple[int, Goal, int], ...]
+    frontier: tuple[FrontierNode, ...] = ()
+    experience_revision: int | None = None

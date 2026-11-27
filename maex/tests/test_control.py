@@ -1,6 +1,7 @@
 """检查双门控、物理事件去重及迟到计划接续。"""
 
 import asyncio
+import json
 from dataclasses import replace
 from math import pi
 from pathlib import Path
@@ -221,7 +222,7 @@ async def test_current_regrasp_is_verified_without_rewriting_pour_history(correc
             return ExecutionFeedback("running", frame(0, 0.04).observation, 1)
 
     executor = Executor(TestRobot(), TestPolicy(), frame(45, 0.04), EePoseAdjustmentConfig(), 100)
-    executive = Executive(None, TestObserver(), executor, LIBRARY, Limits())
+    executive = Executive(None, TestObserver(), executor, LIBRARY, Limits(planner_calls=1))
     executive.tree = IntentionTree(executive.episode_id, Plan(goals=(pickup, pour, second)), LIBRARY)
     assert executive.memory.record(0, 15, Check(Outcome.TRUE, "verified", first_pick))
     executive.memory.grasp_references[0] = frame(15, 0.04)
@@ -239,7 +240,6 @@ async def test_current_regrasp_is_verified_without_rewriting_pour_history(correc
     executive.receive()
     if not correct_grasp:
         assert executive.memory.facts == {1: first_cycle}
-        executive.expanded.add(0)
         executive.decide("Pour milk into the mug twice.")
     chunk = await executive.jobs["motion"]
     assert chunk.task.step == (2 if correct_grasp else 0) and chunk.task.epoch == active.epoch + 1
@@ -553,6 +553,95 @@ def test_late_patch_retains_only_compatible_suffix() -> None:
     assert tree.reconcile(request, patch, memory) == {0: "completed_prefix", 1: "attached"}
     assert tree.branches[0].revision == 0 and tree.branches[1].revision == 1
     assert tree.reconcile(request, patch, memory)[1] == "incompatible_dependency"
+
+
+async def test_speculation_prepares_three_conditional_layers_without_authorizing_them() -> None:
+    popcorn = PICKUP.model_copy(update={"target": "popcorn", "instruction": "Pick up popcorn"})
+    tree = IntentionTree("ep", Plan(goals=(PICKUP, PLACEMENT, CLOSURE, popcorn)), LIBRARY)
+    memory = EpisodicMemory()
+    active = ActiveTask(0, PICKUP, 1, 1, 0, 0, PI05)
+    request = tree.request(1, active, memory)
+
+    class TestPlanner(Planner):
+        async def ask(self, name, output, prompt, context, observation):
+            assert name == "expand_outcomes"
+            snapshot = json.loads(context)
+            assert snapshot["expand_steps"] == [0, 1, 2]
+            for step, layer in enumerate(snapshot["frontier"]):
+                assert layer["requires_verified_step"] == (step - 1 if step else None)
+                assert layer["true"]["next_step"] == step + 1
+                assert layer["false"]["verify_after"] == layer["unknown"]["verify_after"] == step
+                assert not layer["false"]["procedure_refs"] and layer["task_example"] is None
+            return TreePatch(branches=tuple(
+                BranchProposal(step=step, focus="Check geometry", recovery="retry", inspect_focus="Which edge is visible?")
+                for step in snapshot["expand_steps"]
+            )), {}
+
+    planner = TestPlanner(None, None, None, 1)
+    patch, _ = await planner.expand("Put cookies in the microwave, close it, then pick up popcorn.",
+                                    request, (), frame(0).observation)
+    assert tree.reconcile(request, patch, memory) == {0: "attached", 1: "attached", 2: "attached"}
+    assert tree.request(2, active, memory).dependencies == ()
+
+    executor = Executor(None, None, frame(0), EePoseAdjustmentConfig(), 20)
+    executor.commit(active)
+    candidate = ActiveTask(2, CLOSURE, 1, 2, 0, tree.branches[2].revision, PI05)
+    assert IntentGate.blocked(candidate, executor, memory, tree, WorkingMemory(frame(0), 5)) == "ordered_prefix"
+    assert not memory.facts
+
+
+def test_new_role_binding_replaces_only_the_affected_forecast_layer() -> None:
+    relative = PLACEMENT.model_copy(update={
+        "target": "popcorn", "destination": "", "destination_from": 0, "instruction": "Place popcorn at $destination",
+    })
+    tree = IntentionTree("ep", Plan(goals=(PLACEMENT, relative, CLOSURE)), LIBRARY)
+    memory = EpisodicMemory()
+    active = ActiveTask(0, PLACEMENT, 1, 1, 0, 0, PI05)
+    request = tree.request(1, active, memory)
+    assert request.frontier[1].binding_pending
+    prepared = BranchProposal(step=1, focus="Check the destination", recovery="retry", inspect_focus="Which vessel?")
+    assert tree.reconcile(request, TreePatch(branches=(prepared,)), memory) == {1: "attached"}
+    assert tree.branches[1].inspect_focus
+    fact = Fact(0, PLACEMENT, 1, 10, 10, 1, ("front_10",))
+    assert memory.record(0, 10, Check(Outcome.TRUE, "verified", fact))
+
+    patch = TreePatch(branches=(prepared, BranchProposal(step=2, focus="Check the hinge", recovery="retry")))
+    assert tree.reconcile(request, patch, memory) == {1: "incompatible_dependency", 2: "attached"}
+    assert tree.branches[1].bound_goal.destination == PLACEMENT.destination
+    assert not tree.branches[1].inspect_focus
+    successor = replace(active, step=1, goal=tree.goal(1, memory))
+    refreshed = tree.request(2, successor, memory, set(request.dependencies))
+    assert [step for step, _, _ in refreshed.dependencies] == [1]
+    assert not refreshed.frontier[0].binding_pending
+
+
+async def test_prepared_inspection_question_is_loaded_on_uncertain_boundary() -> None:
+    windows = []
+
+    class TestObserver:
+        async def verify(self, window):
+            windows.append(window)
+            return Assessment(judgments=(Judgment(
+                step=0, outcome=Outcome.UNKNOWN, support=(), summary="Occluded",
+            ),)), {}
+
+    executor = Executor(None, None, frame(0), EePoseAdjustmentConfig(), 20)
+    executive = Executive(None, TestObserver(), executor, LIBRARY, Limits())
+    executive.tree = IntentionTree(executive.episode_id, Plan(goals=(PICKUP,)), LIBRARY)
+    assert executive.transition(0)
+    request = executive.tree.request(1, executor.active, executive.memory)
+    query = "Can the wrist view distinguish cookies from the adjacent carton?"
+    patch = TreePatch(branches=(
+        BranchProposal(step=0, focus="Check the grip", recovery="retry", inspect_focus=query),
+    ))
+    assert executive.tree.reconcile(request, patch, executive.memory) == {0: "attached"}
+    for inspect in (False, True):
+        assert executive.verify(inspect=inspect)
+        await executive.jobs["verify"]
+        executive.receive()
+    assert query not in windows[0].focus
+    assert query in windows[1].focus
+    assert executive.memory.progress == 0
 
 
 def test_later_placement_inherits_the_verified_destination() -> None:
@@ -1095,7 +1184,7 @@ async def test_blocked_placement_recovers_a_view_and_keeps_working(placement_vis
     current = frame(20)
     current.observation.robot_state["gripper_command"] = -1.0
     executor = Executor(TestRobot(), TestPolicy(), frame(0), EePoseAdjustmentConfig(), 100)
-    executive = Executive(TestPlanner(), TestObserver(), executor, LIBRARY, Limits())
+    executive = Executive(TestPlanner(), TestObserver(), executor, LIBRARY, Limits(planner_calls=2))
     executive.tree = IntentionTree(
         executive.episode_id, Plan(goals=(PICKUP, PLACEMENT, CLOSURE)), LIBRARY,
     )
@@ -1113,8 +1202,6 @@ async def test_blocked_placement_recovers_a_view_and_keeps_working(placement_vis
     assert executive.memory.record(1, 20, Check(Outcome.TRUE, "verified", placed))
     executive.last_verified_step = 20
     executive.same_boundary_queries = 2
-    executive.expanded.add(2)
-
     executive.decide("Place cookies into the microwave and close it.")
     await executive.jobs["recover"]
     executive.receive()

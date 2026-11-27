@@ -16,17 +16,22 @@ from roboagent.observer.types import ObservationEvent
 from roboagent.types import Observation, summarize_robot_state
 
 from .schema import (
+    LOOKAHEAD_PROCEDURES,
+    LOOKAHEAD_STEPS,
     ActiveTask,
     EvidenceWindow,
     ExecutionMode,
     Facet,
     Fact,
+    FrontierNode,
     Goal,
     Judgment,
     Outcome,
     Plan,
     PlanRequest,
     Predicate,
+    ProcedureReference,
+    TaskStepReference,
     TreePatch,
 )
 
@@ -120,6 +125,11 @@ class Branch:
     revision: int = 0
     request_id: int | None = None
     recovery_procedure: str | None = None
+    bound_goal: Goal | None = None
+    inspect_focus: str = ""
+    procedure_refs: tuple[ProcedureReference, ...] = ()
+    preferred_procedures: tuple[str, ...] = ()
+    task_example: TaskStepReference | None = None
 
 
 class IntentionTree:
@@ -133,29 +143,70 @@ class IntentionTree:
         self.plan = plan
         self.library = library
         self.procedures = procedures
-        self.consulted: set[tuple[int, str]] = set()
-        self.branches = tuple(
-            Branch(
-                successor=step + 1 if step + 1 < len(plan.goals) else None,
-                evidence=library.templates[goal.predicate].evidence,
-                recoveries=library.templates[goal.predicate].recoveries,
-                focus=library.templates[goal.predicate].focus,
-            )
-            for step, goal in enumerate(plan.goals)
+        self.recovery_details = {item.id: item for item in procedures.recoveries} if procedures is not None else {}
+        self.consulted: set[tuple[int, Goal, str]] = set()
+        self.branches = tuple(self.new_branch(step) for step in range(len(plan.goals)))
+
+    def new_branch(self, step: int, goal: Goal | None = None, revision: int = 0) -> Branch:
+        """实例化单步核验、恢复、补证和指向下一层的成功路径。"""
+        template = self.library.templates[self.plan.goals[step].predicate]
+        refs = tuple(
+            item.reference() for item in self.recovery_details.values() if item.applies_to(step, goal)
+        ) if goal is not None else ()
+        return Branch(
+            successor=step + 1 if step + 1 < len(self.plan.goals) else None,
+            evidence=template.evidence,
+            recoveries=template.recoveries,
+            focus=template.focus,
+            revision=revision,
+            bound_goal=goal,
+            procedure_refs=refs,
+            task_example=self.task_example_for(step) if goal is not None else None,
         )
 
-    def prepare_recovery(self, active: ActiveTask, condition: RecoveryCondition) -> RecoveryProcedure | None:
-        """把条件匹配的记忆实例化到当前失败分支，每步对同一条目仅审查一次。"""
-        if self.procedures is None:
+    def task_example_for(self, step: int) -> TaskStepReference | None:
+        """在有序目标及槽位相容时挂载历史计划的对应层。"""
+        exemplar = self.procedures.exemplar if self.procedures is not None else None
+        if exemplar is None or exemplar.plan is None or step >= len(exemplar.plan.goals):
             return None
-        for procedure in self.procedures.recoveries:
-            key = active.step, procedure.id
+        goal = self.plan.goals[step]
+        prior = exemplar.plan.goals[step]
+        if prior.model_copy(update={"instruction": goal.instruction}) == goal and (
+            "$drawer" not in (goal.target, goal.destination) or exemplar.plan.drawer_selection == self.plan.drawer_selection
+        ):
+            return TaskStepReference(exemplar.episode_id, exemplar.task.seed, step)
+        return None
+
+    def replace_branch(self, step: int, branch: Branch) -> None:
+        """发布当前步骤的结构更新。"""
+        self.branches = (*self.branches[:step], branch, *self.branches[step + 1:])
+
+    def bind_branch(self, step: int, goal: Goal) -> Branch:
+        """绑定改变时重建该层目录并撤回依赖旧角色的补丁。"""
+        branch = self.branches[step]
+        if branch.bound_goal != goal:
+            branch = self.new_branch(step, goal, branch.revision + int(branch.bound_goal is not None))
+            self.replace_branch(step, branch)
+        return branch
+
+    def branch_for(self, step: int, memory: EpisodicMemory) -> Branch:
+        """读取该层最新有效的结构，保留尚待观测绑定的角色槽位。"""
+        return self.bind_branch(step, self.goal(step, memory) or self.plan.goals[step])
+
+    def prepare_recovery(self, active: ActiveTask, condition: RecoveryCondition) -> RecoveryProcedure | None:
+        """按进入条件从该层目录加载详细规则，每个绑定只审查一次。"""
+        branch = self.bind_branch(active.step, active.goal)
+        preferences = {reference: rank for rank, reference in enumerate(branch.preferred_procedures)}
+        candidates = sorted(branch.procedure_refs, key=lambda ref: (
+            ref.scope != "task", preferences.get(ref.id, len(preferences)),
+        ))
+        for reference in candidates:
+            procedure = self.recovery_details[reference.id]
+            key = active.step, active.goal, procedure.id
             if key in self.consulted or not procedure.matches(active.step, active.goal, condition):
                 continue
             self.consulted.add(key)
-            branches = list(self.branches)
-            branches[active.step] = replace(branches[active.step], recovery_procedure=procedure.id)
-            self.branches = tuple(branches)
+            self.replace_branch(active.step, replace(branch, recovery_procedure=procedure.id))
             return procedure
         return None
 
@@ -203,15 +254,28 @@ class IntentionTree:
             return goal.target
         return None
 
-    def request(self, request_id: int, active: ActiveTask, memory: EpisodicMemory) -> PlanRequest:
-        """记录以活动步骤为锚的两步范围和声明时的版本。"""
-        dependencies = tuple(
-            (step, self.goal(step, memory) or self.plan.goals[step], self.branches[step].revision)
-            for step in range(active.step, min(active.step + 2, len(self.plan.goals)))
-        )
+    def request(
+        self, request_id: int, active: ActiveTask, memory: EpisodicMemory,
+        attempted: set[tuple[int, Goal, int]] | None = None,
+    ) -> PlanRequest:
+        """从当前步骤沿成功路径展开三层，只请求仍缺的结果分支。"""
+        dependencies = []
+        frontier = []
+        for step in range(active.step, min(active.step + LOOKAHEAD_STEPS, len(self.plan.goals))):
+            resolved = self.goal(step, memory)
+            goal = resolved or self.plan.goals[step]
+            branch = self.bind_branch(step, goal)
+            frontier.append(FrontierNode(
+                step, goal, step - 1 if step > active.step else None, branch.successor, resolved is None,
+                branch.recoveries, branch.procedure_refs[:LOOKAHEAD_PROCEDURES], branch.task_example,
+            ))
+            dependency = step, goal, branch.revision
+            if step not in memory.facts and branch.request_id is None and (attempted is None or dependency not in attempted):
+                dependencies.append(dependency)
         return PlanRequest(
             request_id, self.episode_id, self.id, active.step, active.epoch, memory.version,
-            self.library.version, dependencies,
+            self.library.version, tuple(dependencies), tuple(frontier),
+            self.procedures.revision if self.procedures is not None else None,
         )
 
     def reconcile(self, request: PlanRequest, patch: TreePatch, memory: EpisodicMemory) -> dict[int, str]:
@@ -220,31 +284,34 @@ class IntentionTree:
             request.episode_id != self.episode_id
             or request.tree_id != self.id
             or request.procedures != self.library.version
+            or request.experience_revision != (self.procedures.revision if self.procedures is not None else None)
         ):
             return {proposal.step: "foreign_request" for proposal in patch.branches}
         dependencies = {step: (goal, revision) for step, goal, revision in request.dependencies}
-        branches = list(self.branches)
+        advertised = {node.step: {ref.id for ref in node.procedure_refs} for node in request.frontier}
         decisions: dict[int, str] = {}
         for proposal in patch.branches:
             step = proposal.step
             if step not in dependencies:
                 decisions[step] = "outside_anchor"
                 continue
-            if step < memory.progress:
-                decisions[step] = "completed_prefix"
+            if step in memory.facts:
+                decisions[step] = "completed_prefix" if step < memory.progress else "already_verified"
                 continue
             goal, revision = dependencies[step]
-            branch = branches[step]
-            bound = self.goal(step, memory) or self.plan.goals[step]
-            if goal != bound or revision != branch.revision or proposal.recovery not in branch.recoveries:
+            branch = self.branch_for(step, memory)
+            if goal != branch.bound_goal or revision != branch.revision or proposal.recovery not in branch.recoveries:
                 decisions[step] = "incompatible_dependency"
                 continue
-            branches[step] = replace(
+            available = advertised.get(step, set())
+            preferences = tuple(dict.fromkeys(ref for ref in proposal.preferred_procedures if ref in available))
+            self.replace_branch(step, replace(
                 branch, focus=proposal.focus, recovery=proposal.recovery,
                 revision=revision + 1, request_id=request.request_id,
-            )
-            decisions[step] = "attached"
-        self.branches = tuple(branches)
+                inspect_focus=proposal.inspect_focus, preferred_procedures=preferences,
+            ))
+            decisions[step] = ("attached" if len(preferences) == len(proposal.preferred_procedures)
+                               else "attached_with_filtered_procedures")
         return decisions
 
 

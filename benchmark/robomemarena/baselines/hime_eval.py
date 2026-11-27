@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -14,16 +15,17 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 
-from benchmark.libero._vendor.openpi_client import WebsocketPolicyClient
-from benchmark.robomemarena.baselines.hime_bridge import HiMeSession
+from benchmark.robomemarena.baselines.hime_bridge import HiMePlanError, HiMeSession
 from benchmark.robomemarena.baselines.hime_clients import (
     CONNECTION_RETRY_DELAYS_S,
     PLANNER_FORMAT_REVISION,
     HiMeChatClient,
+    HiMePolicyClient,
     LocalMiniLMEncoder,
     ModelBudgetExceededError,
+    ModelOutputLimitError,
     RecordedEncoder,
 )
 from benchmark.robomemarena.client.artifacts import write_official_artifacts
@@ -31,7 +33,7 @@ from benchmark.robomemarena.client.observation import build_roboagent_observatio
 from benchmark.robomemarena.client.remote_env import RemoteRoboMemArenaEnv
 from benchmark.robomemarena.client.video_recording import RoboMemArenaVideoRecorder
 from benchmark.robomemarena.config import RoboMemArenaConfig
-from benchmark.robomemarena.preprocessing import build_policy_input
+from benchmark.robomemarena.preprocessing import ROBOMEMARENA_DUMMY_ACTION, build_policy_input
 from roboagent.prompts.robomemarena import task_primitive_reference
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -51,24 +53,73 @@ def _load_env(path: Path) -> None:
                 os.environ.setdefault(key, value.strip().strip("\"'"))
 
 
+class EpisodeDeadline(BaseException):
+    """到达正式评测墙钟。在模型调用中穿透 SDK 的普通异常处理。"""
+
+
+class EpisodeClock:
+    """在首个观测后计时，并在同步模型调用和动作边界执行墙钟预算。"""
+
+    def __init__(self, wall_seconds: float, control_hz: float) -> None:
+        self.wall_seconds = wall_seconds
+        self.period = 1 / control_hz
+        self.started_at: float | None = None
+        self.next_action = 0.0
+
+    def begin(self) -> None:
+        self.started_at = time.monotonic()
+
+    def remaining(self) -> float:
+        assert self.started_at is not None
+        left = self.started_at + self.wall_seconds - time.monotonic()
+        if left <= 0:
+            raise EpisodeDeadline
+        return left
+
+    @staticmethod
+    def expire(_signum, _frame) -> None:
+        raise EpisodeDeadline
+
+    def call(self, function, *args):
+        remaining = self.remaining()
+        previous = signal.signal(signal.SIGALRM, self.expire)
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+        try:
+            return function(*args)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+
+    def step(self, env, action):
+        delay = max(0.0, self.next_action - time.monotonic())
+        time.sleep(min(delay, self.remaining()))
+        self.remaining()
+        dispatched = time.monotonic()
+        result = env.step(action)
+        self.next_action = dispatched + self.period
+        return result
+
+
 def execute_episode(
     env, policy, session, recorder, *, max_steps: int, action_chunk_size: int,
-    sentry_interval: int, trace_path: Path,
+    sentry_interval: int, trace_path: Path, clock: EpisodeClock | None = None, post_goal_steps: int = 200,
 ) -> dict:
     """执行 HiMe 闭环；评分仅在本函数返回后读取，不进入规划上下文。"""
     raw = env.reset()
+    if clock is not None:
+        clock.begin()
     recorder.publish(build_roboagent_observation(raw))
     instruction = env.task_description
     reference = task_primitive_reference(instruction)
     if reference:
         instruction += "\n\n" + reference
-    state = session.start(instruction, raw)
+    state = clock.call(session.start, instruction, raw) if clock else session.start(instruction, raw)
     steps, chunks, done = 0, 0, False
     frames = []
     with trace_path.open("a") as trace:
         def record(kind: str, **extra) -> None:
             trace.write(json.dumps({
-                "event": kind, "policy_action_steps": steps, "policy_calls": chunks,
+                "event": kind, "at": time.monotonic(), "policy_action_steps": steps, "policy_calls": chunks,
                 "plan_list": state.plan_list, "subtask": state.current_subtask_description,
                 "hime_done": state.is_done, **extra,
             }, ensure_ascii=False) + "\n")
@@ -77,14 +128,16 @@ def execute_episode(
         record("initial_plan")
         while not done and not state.is_done and steps < max_steps:
             subtask = state.current_subtask_description
-            actions = np.asarray(policy.infer(build_policy_input(raw, subtask))["actions"])
+            payload = build_policy_input(raw, subtask)
+            inference = clock.call(policy.infer, payload) if clock else policy.infer(payload)
+            actions = np.asarray(inference["actions"])
             if (actions.ndim != 2 or actions.shape[1] != 7
                     or len(actions) == 0 or not np.isfinite(actions).all()):
                 raise ValueError("OpenPI must return nonempty finite actions [N, 7]")
             chunks += 1
             chunk_start = steps
             for action in actions[:min(action_chunk_size, max_steps - steps)]:
-                result = env.step(action)
+                result = clock.step(env, action) if clock else env.step(action)
                 raw, done = result.observation, result.done
                 steps += 1
                 recorder.publish(build_roboagent_observation(raw))
@@ -97,14 +150,22 @@ def execute_episode(
             frames.append(session.frames(raw))
             # 终态后不再调用模型；未终止时保持原 HiMe 周期观察与事件触发。
             if not done and steps < max_steps and chunks % sentry_interval == 0:
-                state = session.update(frames)
+                state = clock.call(session.update, frames) if clock else session.update(frames)
                 frames.clear()
                 record("sentry_step")
         stop_reason = "environment_done" if done else "hime_done" if state.is_done else "action_budget"
         if state.is_done and not done:
-            result = env.settle()
-            done = result.done
-            recorder.publish(build_roboagent_observation(result.observation))
+            if clock is None:
+                result = env.settle()
+                done = result.done
+                recorder.publish(build_roboagent_observation(result.observation))
+            else:
+                for _ in range(min(post_goal_steps, max_steps - steps)):
+                    result = clock.step(env, ROBOMEMARENA_DUMMY_ACTION)
+                    done = result.done
+                    recorder.publish(build_roboagent_observation(result.observation))
+                    if done:
+                        break
             record("terminal_settle", environment_done=done)
         record("stop", stop_reason=stop_reason)
     return {
@@ -116,12 +177,16 @@ def execute_episode(
 def main() -> int:
     """运行一次真实 HiMe episode；模型/API 错误保留产物并以非零状态退出。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hime-root", type=Path, default=PROJECT_ROOT / "HiMe")
+    parser.add_argument("--hime-root", type=Path, default=PROJECT_ROOT / "baselines/HiMe")
     parser.add_argument("--env-file", type=Path, default=PROJECT_ROOT / ".env")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--task", type=int, default=1)
     parser.add_argument("--seed", type=int, default=50)
     parser.add_argument("--max-steps", type=int, default=2500)
+    parser.add_argument("--wall-seconds", type=float, default=900)
+    parser.add_argument("--control-hz", type=float, default=20)
+    parser.add_argument("--video-fps", type=int, default=10)
+    parser.add_argument("--max-sentry-tokens", type=int, default=700)
     parser.add_argument("--action-chunk-size", type=int, default=20)
     parser.add_argument("--sentry-interval", type=int, default=5)
     parser.add_argument("--sentry-window", type=int, default=8)
@@ -136,7 +201,8 @@ def main() -> int:
     parser.add_argument("--sentry-model", default="robo-observer")
     parser.add_argument("--local-embedding-model", type=Path)
     args = parser.parse_args()
-    for name in ("action_chunk_size", "sentry_interval", "sentry_window", "fallback_images",
+    for name in ("max_steps", "wall_seconds", "control_hz", "video_fps", "max_sentry_tokens",
+                 "action_chunk_size", "sentry_interval", "sentry_window", "fallback_images",
                  "max_planner_calls", "max_sentry_calls"):
         if getattr(args, name) < 1:
             parser.error(f"{name} must be positive")
@@ -153,7 +219,7 @@ def main() -> int:
         parser.error("--hime-root must point to the original HiMe checkout")
     config = RoboMemArenaConfig(task_id=args.task, seed=args.seed, max_steps=args.max_steps)
     local_embedding = args.local_embedding_model.resolve() if args.local_embedding_model else None
-    run_dir.mkdir(parents=True, exist_ok=False)
+    run_dir.mkdir(parents=True, exist_ok=True)
     shutil.copytree(PROMPT_DIR, run_dir / "prompts")
     hashes = {
         str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -170,21 +236,22 @@ def main() -> int:
     _write_json(run_dir / "run_config.json", {
         **vars(args), "baseline": "HiMe-Same-Backbone", "hime_revision": revision,
         "planner_model": os.environ["LLM_MODEL_NAME"], "planner_max_tokens": max_tokens,
-        "planner_extra_body": extra_body, "sentry_max_tokens": 512,
+        "planner_extra_body": extra_body, "sentry_max_tokens": args.max_sentry_tokens,
         "connection_retry_delays_s": CONNECTION_RETRY_DELAYS_S,
         "planner_format_revision": PLANNER_FORMAT_REVISION,
         "embedding_model": str(local_embedding) if local_embedding else os.environ["EMBEDDING_MODEL"],
         "embedding_variant": "local-MiniLM-adaptation" if local_embedding else "OpenAI-compatible",
         "memory_initialization": "fresh-per-episode", "primitive_reference": "same-as-RoboAgent",
         "policy": "pi05_robomemarena", "source_sha256": hashes,
-        "budget_protocol": "physical steps and separate model request caps; not token-matched",
+        "budget_protocol": "shared wall, physical and model-call caps",
     })
     # 原 HiMe 的相对日志路径落到本次 run 中，不写入上游源码目录。
     os.chdir(run_dir)
     sys.path.insert(0, str(root))
     resources = ExitStack()
     env = policy = session = None
-    recorder = RoboMemArenaVideoRecorder(run_dir / "videos", task_id=args.task)
+    recorder = RoboMemArenaVideoRecorder(run_dir / "videos", task_id=args.task, fps=args.video_fps)
+    clock = EpisodeClock(args.wall_seconds, args.control_hz)
     outcome, evaluation = {}, None
     started = time.monotonic()
     exit_code = 0
@@ -204,12 +271,12 @@ def main() -> int:
         recorded_encoder.encode_text("RoboMemArena memory connectivity check")
         planner_api = OpenAI(
             api_key=os.environ["LLM_API_KEY"], base_url=os.environ["LLM_BASE_URL"],
-            timeout=180, max_retries=0,
+            timeout=60, max_retries=0,
         )
         resources.callback(planner_api.close)
         sentry_api = OpenAI(
             api_key=os.environ.get("OBSERVER_OPENAI_API_KEY", "EMPTY"),
-            base_url=args.sentry_base_url, timeout=180, max_retries=0,
+            base_url=args.sentry_base_url, timeout=35, max_retries=0,
         )
         resources.callback(sentry_api.close)
         session = HiMeSession(
@@ -221,7 +288,7 @@ def main() -> int:
             ),
             HiMeChatClient(
                 sentry_api, model=args.sentry_model, role="sentry",
-                log_path=run_dir / "model_calls.jsonl", max_tokens=512,
+                log_path=run_dir / "model_calls.jsonl", max_tokens=args.max_sentry_tokens,
                 max_calls=args.max_sentry_calls,
             ),
             recorded_encoder, window_size=args.sentry_window, fallback_images=args.fallback_images,
@@ -229,21 +296,32 @@ def main() -> int:
         resources.callback(session.close)
         env = RemoteRoboMemArenaEnv(config, host=args.env_host, port=args.env_port)
         resources.callback(env.close)
-        policy = WebsocketPolicyClient(args.policy_host, args.policy_port)
+        policy = HiMePolicyClient(args.policy_host, args.policy_port, task=args.task, seed=args.seed)
         resources.callback(policy.close)
         _write_json(run_dir / "policy_metadata.json", policy.get_server_metadata())
         outcome = execute_episode(
             env, policy, session, recorder, max_steps=args.max_steps,
             action_chunk_size=args.action_chunk_size, sentry_interval=args.sentry_interval,
-            trace_path=run_dir / "trace.jsonl",
+            trace_path=run_dir / "trace.jsonl", clock=clock, post_goal_steps=config.post_goal_steps,
         )
+    except EpisodeDeadline:
+        outcome = {"stop_reason": "wall_budget"}
+    except (TimeoutError, APITimeoutError) as exc:
+        if clock.started_at is None:
+            exit_code = 1
+        outcome = {"stop_reason": "control_timeout", "reason": str(exc)}
+    except HiMePlanError as exc:
+        outcome = {"stop_reason": "invalid_plan", "reason": str(exc)}
     except ModelBudgetExceededError as exc:
         outcome = {"stop_reason": "model_budget", "reason": str(exc)}
+    except ModelOutputLimitError as exc:
+        outcome = {"stop_reason": "model_output_limit", "reason": str(exc)}
     except Exception as exc:
         outcome = {"stop_reason": "infrastructure_or_protocol_error", "error_type": type(exc).__name__}
         print(f"HiMe run failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         exit_code = 1
     finally:
+        terminated_at = time.monotonic()
         try:
             if session is not None:
                 session.memory.save_to_json(str(run_dir / "memory.json"))
@@ -265,6 +343,20 @@ def main() -> int:
         outcome["elapsed_s"] = time.monotonic() - started
         outcome["valid_rollout"] = exit_code == 0
         _write_json(run_dir / "result.json", outcome)
+        events = run_dir / "trace.jsonl"
+        if clock.started_at is not None and evaluation is not None:
+            status = ("error" if exit_code else "timeout" if outcome["stop_reason"] in {"wall_budget", "control_timeout"}
+                      else "success" if evaluation["TSR"] else "failure")
+            _write_json(run_dir / "trace.json", {
+                "episode": {
+                    "status": status, "summary": outcome["stop_reason"],
+                    "details": {"journal": [json.loads(line) for line in events.read_text().splitlines()]
+                                if events.is_file() else []},
+                },
+                "evaluation": evaluation,
+                "timing": {"first_observation_at": clock.started_at, "terminated_at": terminated_at,
+                           "vla_sent_at": policy.sent_at if policy is not None else []},
+            })
     print(json.dumps({"run_dir": str(run_dir), "result": outcome, "evaluation": evaluation}, default=str))
     return exit_code
 
